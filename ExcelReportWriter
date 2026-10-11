@@ -1,0 +1,413 @@
+
+
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class ExcelReportWriter {
+
+    private static final String MEASUREMENTS_SHEET = "Measurements";
+    private static final String SUMMARY_SHEET = "Run Summary";
+
+    private static final String[] MEASUREMENT_HEADERS = {
+            "Run ID",
+            "Recorded At",
+            "Operation",
+            "Mode",
+            "Batch ID",
+            "Batch Size",
+            "Record ID",
+            "SQL Execution (ms)",
+            "Redis Replication Latency (ms)",
+            "End-to-End (ms)",
+            "Poll Attempts",
+            "Success",
+            "Error"
+    };
+
+    private static final String[] SUMMARY_HEADERS = {
+            "Run ID",
+            "Operation",
+            "Mode",
+            "Batch Size",
+            "Total Records",
+            "Successful Records",
+            "Failed Records",
+            "Success Rate (%)",
+            "SQL Average (ms)",
+            "SQL P50 (ms)",
+            "SQL P95 (ms)",
+            "SQL P99 (ms)",
+            "SQL Maximum (ms)",
+            "SQL Samples",
+            "Redis Average (ms)",
+            "Redis P50 (ms)",
+            "Redis P95 (ms)",
+            "Redis P99 (ms)",
+            "Redis Maximum (ms)",
+            "Redis Samples"
+    };
+
+    private ExcelReportWriter() {
+    }
+
+    /**
+     * Appends this run's results to the Measurements sheet and rebuilds
+     * Run Summary from all measurements currently in the workbook.
+     */
+    public static void appendResults(
+            Path outputPath,
+            List<TestResult> results
+    ) throws IOException {
+
+        Objects.requireNonNull(outputPath, "outputPath cannot be null");
+        Objects.requireNonNull(results, "results cannot be null");
+
+        Path absolutePath = outputPath.toAbsolutePath();
+        Path parent = absolutePath.getParent();
+
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+
+        Workbook workbook;
+
+        if (Files.exists(absolutePath) && Files.size(absolutePath) > 0) {
+            try (InputStream input = Files.newInputStream(absolutePath)) {
+                workbook = WorkbookFactory.create(input);
+            }
+        } else {
+            workbook = new XSSFWorkbook();
+        }
+
+        try (workbook) {
+            Sheet measurements = getOrCreateSheet(
+                    workbook,
+                    MEASUREMENTS_SHEET,
+                    MEASUREMENT_HEADERS
+            );
+
+            ensureHeader(measurements, MEASUREMENT_HEADERS);
+
+            for (TestResult result : results) {
+                appendMeasurement(measurements, result);
+            }
+
+            rebuildSummary(workbook, measurements);
+
+            try (OutputStream output = Files.newOutputStream(absolutePath)) {
+                workbook.write(output);
+            }
+        }
+    }
+
+    private static Sheet getOrCreateSheet(
+            Workbook workbook,
+            String sheetName,
+            String[] headers
+    ) {
+        Sheet sheet = workbook.getSheet(sheetName);
+
+        if (sheet == null) {
+            sheet = workbook.createSheet(sheetName);
+            writeHeader(sheet, headers);
+        }
+
+        return sheet;
+    }
+
+    private static void ensureHeader(Sheet sheet, String[] headers) {
+        if (sheet.getPhysicalNumberOfRows() == 0) {
+            writeHeader(sheet, headers);
+        }
+    }
+
+    private static void writeHeader(Sheet sheet, String[] headers) {
+        Row headerRow = sheet.createRow(0);
+        CellStyle style = createHeaderStyle(sheet.getWorkbook());
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(style);
+        }
+
+        headerRow.setHeightInPoints(30);
+        sheet.createFreezePane(0, 1);
+    }
+
+    private static CellStyle createHeaderStyle(Workbook workbook) {
+        Font font = workbook.createFont();
+        font.setBold(true);
+
+        CellStyle style = workbook.createCellStyle();
+        style.setFont(font);
+        style.setWrapText(true);
+
+        return style;
+    }
+
+    private static void appendMeasurement(
+            Sheet sheet,
+            TestResult result
+    ) {
+        int rowIndex = sheet.getLastRowNum() + 1;
+        Row row = sheet.createRow(rowIndex);
+
+        setText(row, 0, result.runId());
+        setText(row, 1, result.recordedAt() == null
+                ? ""
+                : result.recordedAt().toString());
+        setText(row, 2, result.operation());
+        setText(row, 3, result.mode());
+        setText(row, 4, result.batchId());
+        setNumber(row, 5, result.batchSize());
+        setNumber(row, 6, result.recordId());
+        setNumber(row, 7, toMillis(result.sqlDurationNanos()));
+        setNumber(row, 8, toMillis(result.propagationLatencyNanos()));
+        setNumber(row, 9, toMillis(result.endToEndNanos()));
+        setNumber(row, 10, result.pollAttempts());
+        setText(row, 11, Boolean.toString(result.success()));
+        setText(row, 12, result.error() == null ? "" : result.error());
+    }
+
+    private static void rebuildSummary(
+            Workbook workbook,
+            Sheet measurements
+    ) {
+        int oldSummaryIndex = workbook.getSheetIndex(SUMMARY_SHEET);
+
+        if (oldSummaryIndex >= 0) {
+            workbook.removeSheetAt(oldSummaryIndex);
+        }
+
+        Sheet summary = workbook.createSheet(SUMMARY_SHEET);
+        writeHeader(summary, SUMMARY_HEADERS);
+
+        Map<SummaryKey, SummaryStats> groups = new TreeMap<>(
+                Comparator.comparing(SummaryKey::runId)
+                        .thenComparing(SummaryKey::operation)
+                        .thenComparing(SummaryKey::mode)
+                        .thenComparingInt(SummaryKey::batchSize)
+        );
+
+        for (int i = 1; i <= measurements.getLastRowNum(); i++) {
+            Row row = measurements.getRow(i);
+
+            if (row == null || isBlank(row.getCell(0))) {
+                continue;
+            }
+
+            String runId = getText(row, 0);
+            String operation = getText(row, 2);
+            String mode = getText(row, 3);
+            int batchSize = (int) getNumber(row, 5);
+
+            SummaryKey key = new SummaryKey(
+                    runId,
+                    operation,
+                    mode,
+                    batchSize
+            );
+
+            SummaryStats stats = groups.computeIfAbsent(
+                    key,
+                    ignored -> new SummaryStats()
+            );
+
+            stats.totalRecords++;
+
+            boolean success = Boolean.parseBoolean(getText(row, 11));
+
+            if (success) {
+                stats.successfulRecords++;
+            } else {
+                stats.failedRecords++;
+            }
+
+            double sqlMillis = getNumber(row, 7);
+            double redisMillis = getNumber(row, 8);
+
+            // The runner should store SQL duration only on the row that
+            // represents that SQL execution. Other rows should contain -1.
+            if (sqlMillis >= 0) {
+                stats.sqlSamples.add(sqlMillis);
+            }
+
+            // Keep every available propagation measurement, including
+            // timeout/failure measurements if one was actually obtained.
+            if (redisMillis >= 0) {
+                stats.redisSamples.add(redisMillis);
+            }
+        }
+
+        int rowIndex = 1;
+
+        for (Map.Entry<SummaryKey, SummaryStats> entry : groups.entrySet()) {
+            Row row = summary.createRow(rowIndex++);
+            SummaryKey key = entry.getKey();
+            SummaryStats stats = entry.getValue();
+
+            setText(row, 0, key.runId());
+            setText(row, 1, key.operation());
+            setText(row, 2, key.mode());
+            setNumber(row, 3, key.batchSize());
+            setNumber(row, 4, stats.totalRecords);
+            setNumber(row, 5, stats.successfulRecords);
+            setNumber(row, 6, stats.failedRecords);
+
+            double successRate = stats.totalRecords == 0
+                    ? 0.0
+                    : 100.0 * stats.successfulRecords / stats.totalRecords;
+
+            setNumber(row, 7, successRate);
+
+            writeStatistics(row, 8, stats.sqlSamples);
+            setNumber(row, 13, stats.sqlSamples.size());
+
+            writeStatistics(row, 14, stats.redisSamples);
+            setNumber(row, 19, stats.redisSamples.size());
+        }
+
+        summary.createFreezePane(0, 1);
+        autoSizeColumns(summary, SUMMARY_HEADERS.length);
+        autoSizeColumns(measurements, MEASUREMENT_HEADERS.length);
+    }
+
+    /**
+     * Writes average, P50, P95, P99 and maximum.
+     * Values are already in milliseconds.
+     */
+    private static void writeStatistics(
+            Row row,
+            int startColumn,
+            List<Double> values
+    ) {
+        if (values.isEmpty()) {
+            for (int i = 0; i < 5; i++) {
+                setText(row, startColumn + i, "N/A");
+            }
+            return;
+        }
+
+        List<Double> sorted = values.stream()
+                .sorted()
+                .collect(Collectors.toList());
+
+        double average = sorted.stream()
+                .mapToDouble(Double::doubleValue)
+                .average()
+                .orElse(0.0);
+
+        setNumber(row, startColumn, average);
+        setNumber(row, startColumn + 1, percentile(sorted, 50));
+        setNumber(row, startColumn + 2, percentile(sorted, 95));
+        setNumber(row, startColumn + 3, percentile(sorted, 99));
+        setNumber(row, startColumn + 4, sorted.get(sorted.size() - 1));
+    }
+
+    /**
+     * Nearest-rank percentile.
+     */
+    private static double percentile(List<Double> sorted, int percentile) {
+        if (sorted.isEmpty()) {
+            return -1;
+        }
+
+        int index = (int) Math.ceil(
+                (percentile / 100.0) * sorted.size()
+        ) - 1;
+
+        index = Math.max(0, Math.min(index, sorted.size() - 1));
+
+        return sorted.get(index);
+    }
+
+    private static double toMillis(long nanos) {
+        return nanos < 0 ? -1 : nanos / 1_000_000.0;
+    }
+
+    private static void autoSizeColumns(Sheet sheet, int columnCount) {
+        for (int i = 0; i < columnCount; i++) {
+            sheet.autoSizeColumn(i);
+
+            // Avoid extremely wide columns for long errors.
+            if (i == 12) {
+                sheet.setColumnWidth(i, Math.min(
+                        sheet.getColumnWidth(i),
+                        12000
+                ));
+            }
+        }
+    }
+
+    private static void setText(Row row, int column, String value) {
+        row.createCell(column).setCellValue(value == null ? "" : value);
+    }
+
+    private static void setNumber(Row row, int column, double value) {
+        row.createCell(column).setCellValue(value);
+    }
+
+    private static String getText(Row row, int column) {
+        Cell cell = row.getCell(column);
+
+        if (cell == null) {
+            return "";
+        }
+
+        return new DataFormatter().formatCellValue(cell).trim();
+    }
+
+    private static double getNumber(Row row, int column) {
+        Cell cell = row.getCell(column);
+
+        if (cell == null) {
+            return -1;
+        }
+
+        try {
+            if (cell.getCellType() == CellType.NUMERIC) {
+                return cell.getNumericCellValue();
+            }
+
+            String value = new DataFormatter()
+                    .formatCellValue(cell)
+                    .trim();
+
+            return value.isEmpty() ? -1 : Double.parseDouble(value);
+        } catch (NumberFormatException exception) {
+            return -1;
+        }
+    }
+
+    private static boolean isBlank(Cell cell) {
+        return cell == null
+                || new DataFormatter().formatCellValue(cell).isBlank();
+    }
+
+    private record SummaryKey(
+            String runId,
+            String operation,
+            String mode,
+            int batchSize
+    ) {
+    }
+
+    private static final class SummaryStats {
+        private int totalRecords;
+        private int successfulRecords;
+        private int failedRecords;
+
+        private final List<Double> sqlSamples = new ArrayList<>();
+        private final List<Double> redisSamples = new ArrayList<>();
+    }
+}
