@@ -1,0 +1,350 @@
+package com.cibc.main;
+
+import com.cibc.main.TestResult.Operation;
+import com.cibc.main.TestResult.Status;
+import com.cibc.main.config.Config;
+import io.lettuce.core.RedisException;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.LockSupport;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+// Runs the INSERT -> UPDATE -> DELETE lifecycle, first one record per statement ("single"),
+// then batchSize records per statement ("batch"), and measures how long each change takes to reach Redis.
+public class TestRunner {
+
+    public static final String SINGLE = "single";
+    public static final String BATCH = "batch";
+
+    private final String runId;
+    private final SqlServerClientWrapper sqlClient;
+    private final RedisClientWrapper redisClient;
+    private final CsvResultWriter csvWriter;
+
+    private final String keyPrefix;
+    private final int recordCount;
+    private final int batchSize;
+    private final int threads;
+    private final Duration pollInterval;
+    private final Duration redisTimeout;
+
+    // Ids that exist in the table and have not been deleted yet, so leftovers can be cleaned up at the end
+    private final Set<Long> liveIds = ConcurrentHashMap.newKeySet();
+
+    // Each worker thread reuses its own SQL connection, so connection/login time is never measured
+    private final ThreadLocal<Connection> threadConnection = new ThreadLocal<>();
+    private final List<Connection> openConnections = Collections.synchronizedList(new ArrayList<>());
+
+    // A record to write or check. data is the value expected in Redis (null for DELETE = key must be gone).
+    private record Row(Long id, String data) {
+    }
+
+    private record Observation(Status status, Double propagationMillis, String error) {
+    }
+
+    // >>> NEW: result of the SQL step only, so SQL and Redis checking can be separated
+    // Outcome of one SQL statement: its rows (with ids) and SQL duration. sqlError is null on success.
+    private record SqlStep(int batchNumber, Instant startedAt, List<Row> rows, Double sqlMillis, String sqlError) {
+    }
+    // <<< END
+
+    public TestRunner(Config config, String runId, SqlServerClientWrapper sqlClient,
+                      RedisClientWrapper redisClient, CsvResultWriter csvWriter) {
+        this.runId = runId;
+        this.sqlClient = sqlClient;
+        this.redisClient = redisClient;
+        this.csvWriter = csvWriter;
+        this.keyPrefix = config.getRedisKeyPrefix();
+        this.recordCount = config.getRecordCount();
+        this.batchSize = config.getBatchSize();
+        this.threads = config.getThreads();
+        this.pollInterval = config.getPollInterval();
+        this.redisTimeout = config.getRedisTimeout();
+    }
+
+    public List<TestResult> run() throws InterruptedException {
+        List<TestResult> results = new ArrayList<>();
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+
+        try {
+            results.addAll(runLifecycle(executor, SINGLE, 1));
+            results.addAll(runLifecycle(executor, BATCH, batchSize));
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+            cleanUp();
+            closeConnections();
+        }
+
+        return results;
+    }
+
+    private List<TestResult> runLifecycle(ExecutorService executor, String mode, int unitSize)
+            throws InterruptedException {
+        System.out.printf("%nRunning %s tests (%d records, %d per statement, %d threads)...%n",
+                mode, recordCount, unitSize, threads);
+
+        List<Row> newRows = IntStream.range(0, recordCount)
+                .mapToObj(i -> new Row(null, "insert-" + runId + "-" + mode + "-" + i))
+                .toList();
+        List<TestResult> inserts = runPhase(executor, Operation.INSERT, mode, unitSize, newRows);
+
+        // Only records confirmed in Redis are updated and deleted, so a missing key can't be mistaken for a delete
+        List<Long> insertedIds = inserts.stream()
+                .filter(TestResult::success)
+                .map(TestResult::recordId)
+                .toList();
+
+        List<Row> updateRows = insertedIds.stream()
+                .map(id -> new Row(id, "update-" + runId + "-" + id))
+                .toList();
+        List<TestResult> updates = runPhase(executor, Operation.UPDATE, mode, unitSize, updateRows);
+
+        List<Row> deleteRows = insertedIds.stream()
+                .map(id -> new Row(id, null))
+                .toList();
+        List<TestResult> deletes = runPhase(executor, Operation.DELETE, mode, unitSize, deleteRows);
+
+        List<TestResult> results = new ArrayList<>(inserts);
+        results.addAll(updates);
+        results.addAll(deletes);
+        return results;
+    }
+
+    // >>> CHANGED: SQL runs on the worker threads while this thread polls Redis for everything committed so far;
+    //              results are built here once both are done (previously each task did SQL + its own Redis wait)
+    // Runs every SQL statement of the phase concurrently on the worker threads, while this thread polls Redis
+    // for all records committed so far. Each record is checked from the moment its own statement commits.
+    private List<TestResult> runPhase(ExecutorService executor, Operation operation, String mode,
+                                      int unitSize, List<Row> rows) throws InterruptedException {
+        Map<Row, Long> committed = new ConcurrentHashMap<>(); // row -> commit time, filled by the SQL threads
+        List<Future<SqlStep>> futures = new ArrayList<>();
+
+        for (int start = 0, batchNumber = 1; start < rows.size(); start += unitSize, batchNumber++) {
+            List<Row> batch = rows.subList(start, Math.min(start + unitSize, rows.size()));
+            int number = batchNumber;
+            futures.add(executor.submit(() -> runSql(operation, mode, number, batch, committed)));
+        }
+
+        Map<Row, Observation> observations = awaitPropagation(operation, futures, committed);
+
+        List<SqlStep> steps = new ArrayList<>();
+        for (Future<SqlStep> future : futures) {
+            try {
+                steps.add(future.get());
+            } catch (ExecutionException e) {
+                throw new IllegalStateException("Unexpected error while running " + operation, e.getCause());
+            }
+        }
+
+        int configuredSize = BATCH.equals(mode) ? batchSize : 1;
+        List<TestResult> results = new ArrayList<>();
+
+        for (SqlStep step : steps) {
+            for (Row row : step.rows()) {
+                Observation observation = step.sqlError() == null
+                        ? observations.get(row)
+                        : new Observation(Status.SQL_ERROR, null, step.sqlError());
+                Double propagation = observation.propagationMillis();
+                Double total = propagation == null ? null : step.sqlMillis() + propagation;
+
+                TestResult result = new TestResult(runId, step.startedAt(), operation, mode, step.batchNumber(),
+                        configuredSize, threads, row.id(), step.sqlMillis(), propagation, total,
+                        observation.status(), observation.error());
+                csvWriter.write(result);
+                results.add(result);
+            }
+        }
+
+        printPhaseSummary(operation, results);
+        return results;
+    }
+    // <<< END
+
+    // >>> CHANGED: replaces runBatch; only runs the SQL and records each row's commit time, no Redis wait
+    // Executes one SQL statement (one row in single mode, many in batch mode) and hands its rows
+    // to the Redis poller via committed. Does not wait for Redis.
+    private SqlStep runSql(Operation operation, String mode, int batchNumber, List<Row> rows,
+                           Map<Row, Long> committed) {
+        Instant startedAt = Instant.now();
+
+        try {
+            Connection connection = connection();
+            long sqlStart = System.nanoTime();
+            List<Row> executed = executeSql(connection, operation, mode, rows);
+            long sqlEnd = System.nanoTime();
+            executed.forEach(row -> committed.put(row, sqlEnd));
+            return new SqlStep(batchNumber, startedAt, executed, toMillis(sqlEnd - sqlStart), null);
+        } catch (SQLException e) {
+            return new SqlStep(batchNumber, startedAt, rows, null, e.getMessage());
+        }
+    }
+    // <<< END
+
+    // Returns the rows with their ids filled in (ids are only generated for INSERT)
+    private List<Row> executeSql(Connection connection, Operation operation, String mode, List<Row> rows)
+            throws SQLException {
+        boolean batch = BATCH.equals(mode);
+
+        return switch (operation) {
+            case INSERT -> {
+                List<String> data = rows.stream().map(Row::data).toList();
+                List<Long> ids = batch
+                        ? sqlClient.insertBatch(connection, data)
+                        : List.of(sqlClient.insert(connection, data.get(0)));
+                liveIds.addAll(ids);
+                yield IntStream.range(0, rows.size())
+                        .mapToObj(i -> new Row(ids.get(i), data.get(i)))
+                        .toList();
+            }
+            case UPDATE -> {
+                if (batch) {
+                    Map<Long, String> dataById = rows.stream()
+                            .collect(Collectors.toMap(Row::id, Row::data, (a, b) -> a, LinkedHashMap::new));
+                    sqlClient.updateBatch(connection, dataById);
+                } else {
+                    sqlClient.update(connection, rows.get(0).id(), rows.get(0).data());
+                }
+                yield rows;
+            }
+            case DELETE -> {
+                if (batch) {
+                    sqlClient.deleteBatch(connection, rows.stream().map(Row::id).toList());
+                } else {
+                    sqlClient.delete(connection, rows.get(0).id());
+                }
+                rows.forEach(row -> liveIds.remove(row.id()));
+                yield rows;
+            }
+        };
+    }
+
+    // >>> CHANGED: one poller for the whole phase; reads all pending keys per poll (pipelined),
+    //              runs until SQL is finished and nothing is pending, and times out each row from its own commit
+    // Polls Redis for every committed record at once until each shows its expected data (or is gone, for DELETE)
+    // or its own timeout expires. Runs until all SQL statements have finished and nothing is left to check.
+    // Each record's latency is measured from the commit of its own SQL statement.
+    private Map<Row, Observation> awaitPropagation(Operation operation, List<Future<SqlStep>> sqlTasks,
+                                                   Map<Row, Long> pending) {
+        Map<Row, Observation> observations = new HashMap<>();
+        String lastRedisError = null;
+
+        while (true) {
+            // Checked before reading pending, so rows from statements that just finished are not missed
+            boolean sqlDone = sqlTasks.stream().allMatch(Future::isDone);
+            List<Row> rows = new ArrayList<>(pending.keySet());
+
+            if (rows.isEmpty() && sqlDone) {
+                return observations;
+            }
+
+            if (!rows.isEmpty()) {
+                try {
+                    List<String> values = redisClient.readData(rows.stream().map(row -> keyPrefix + row.id()).toList());
+                    long observedAt = System.nanoTime();
+
+                    for (int i = 0; i < rows.size(); i++) {
+                        Row row = rows.get(i);
+                        // For DELETE row.data() is null, which matches a missing key
+                        if (Objects.equals(values.get(i), row.data())) {
+                            long committedAt = pending.remove(row);
+                            observations.put(row, new Observation(Status.SUCCESS, toMillis(observedAt - committedAt), null));
+                        }
+                    }
+                } catch (RedisException e) {
+                    // Keep polling; a transient Redis error shouldn't fail the measurement
+                    lastRedisError = e.getMessage();
+                }
+
+                // Give up on records that have waited longer than the timeout since their own commit
+                long now = System.nanoTime();
+                for (Row row : rows) {
+                    Long committedAt = pending.get(row);
+                    if (committedAt != null && now - committedAt > redisTimeout.toNanos()) {
+                        pending.remove(row);
+                        observations.put(row, timedOut(operation, lastRedisError));
+                    }
+                }
+            }
+
+            LockSupport.parkNanos(pollInterval.toNanos());
+        }
+    }
+    // <<< END
+
+    // >>> NEW: builds the TIMEOUT / REDIS_ERROR result (was inline at the end of the old awaitPropagation)
+    private Observation timedOut(Operation operation, String lastRedisError) {
+        String error = "Redis did not reflect the " + operation + " within " + redisTimeout.toSeconds() + "s";
+
+        if (lastRedisError == null) {
+            return new Observation(Status.TIMEOUT, null, error);
+        }
+        return new Observation(Status.REDIS_ERROR, null, error + "; last Redis error: " + lastRedisError);
+    }
+    // <<< END
+
+    private Connection connection() throws SQLException {
+        Connection connection = threadConnection.get();
+
+        if (connection == null || connection.isClosed()) {
+            connection = sqlClient.openConnection();
+            threadConnection.set(connection);
+            openConnections.add(connection);
+        }
+        return connection;
+    }
+
+    // Deletes any test records left in the table (failed or skipped deletes). Not measured.
+    private void cleanUp() {
+        if (liveIds.isEmpty()) {
+            return;
+        }
+
+        System.out.println("Cleaning up " + liveIds.size() + " leftover test record(s)...");
+        try {
+            Connection connection = connection();
+            for (Long id : liveIds) {
+                try {
+                    sqlClient.delete(connection, id);
+                } catch (SQLException e) {
+                    System.err.println("Could not delete leftover record id = " + id + ": " + e.getMessage());
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Cleanup failed, leftover ids: " + liveIds + " (" + e.getMessage() + ")");
+        }
+    }
+
+    private void closeConnections() {
+        for (Connection connection : openConnections) {
+            try {
+                connection.close();
+            } catch (SQLException e) {
+                System.err.println("Error closing SQL connection: " + e.getMessage());
+            }
+        }
+        openConnections.clear();
+    }
+
+    private static void printPhaseSummary(Operation operation, List<TestResult> results) {
+        long successes = results.stream().filter(TestResult::success).count();
+        OptionalDouble average = results.stream()
+                .filter(TestResult::success)
+                .mapToDouble(TestResult::redisPropagationMillis)
+                .average();
+
+        System.out.printf("  %-6s %d/%d succeeded, average Redis propagation: %s%n",
+                operation, successes, results.size(),
+                average.isPresent() ? String.format("%.1f ms", average.getAsDouble()) : "n/a");
+    }
+
+    private static double toMillis(long nanos) {
+        return nanos / 1_000_000.0;
+    }
+}
