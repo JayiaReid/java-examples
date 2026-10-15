@@ -1,4 +1,4 @@
-package com.cibc.main.test;
+package com.cibc.main;
 
 import java.time.Instant;
 
@@ -7,18 +7,13 @@ public record TestResult(
         Instant timestamp,
         String operation,
         String mode,
-        String batchId,
+        Long recordId,
         int batchSize,
-        long recordId,
-        long sqlDurationNanos,
-        long redisPropagationNanos,
-        long totalDurationNanos,
-        int pollAttempts,
+        double sqlDurationMillis,
+        double redisPropagationMillis,
+        double totalDurationMillis,
         boolean success,
         boolean timeout,
         String error
 ) {
-    public double sqlDurationMillis() { return sqlDurationNanos / 1_000_000.0; }
-    public double redisPropagationMillis() { return redisPropagationNanos / 1_000_000.0; }
-    public double totalDurationMillis() { return totalDurationNanos / 1_000_000.0; }
 }
