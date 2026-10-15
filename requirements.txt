@@ -1,0 +1,32 @@
+
+Requirements
+[ ] Java or Golang application
+[ ] Containerization application (optional)
+[ ] NOTE: if not deployed on OpenShift there is additional network latency
+[ ] Please containerize for final performance testing results
+[ ] Connect to Azure SQL Server database using SPN
+[x] Connect to Redis database
+
+Test Requirements
+
+INSERT records
+[x] Publish X amount of messages
+[x] Check when messages appear on Redis cache
+[x] Get average time difference of updates
+
+UPDATE records
+[x] Update messages from TEST 1
+[x] Check average time it took to update the messages
+
+DELETE records
+[ ] Delete specific messages
+[ ] Check average time it took for record to delete from Redis
+
+PIPELINE
+- Create new table and pipeline that has significant data transformations, etc using JMESPATH operations
+- Add new fields, manipulate fields before and after, etc
+- Test difference between hash and json
+- RDI RESET
+- Wipe out database and insert X amount of data
+- Trigger RDI reset and cache reset (ie. delete keys manually)
+- BATCH INSERT/DELETE/UPDATE
