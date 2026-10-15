@@ -1,130 +1,103 @@
-package com.cibc.main.sql;
+package com.cibc.main;
 
 import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
+import com.microsoft.sqlserver.jdbc.SQLServerException;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.sql.Timestamp;
+import java.sql.*;
 import java.time.Instant;
 import java.util.List;
 
-public final class SqlServerClientWrapper {
-    private final SQLServerDataSource dataSource;
-    private final String tableName;
+public class SqlServerClientWrapper {
 
-    public SqlServerClientWrapper(SQLServerDataSource dataSource, String tableName) {
-        this.dataSource = dataSource;
-        this.tableName = tableName;
+    private final SQLServerDataSource client;
+
+    public SqlServerClientWrapper(SQLServerDataSource client) {
+        this.client = client;
     }
 
     public boolean testConnection() {
-        try (Connection connection = dataSource.getConnection()) {
+
+        try (Connection connection = client.getConnection()) {
             return connection.isValid(5);
+
         } catch (SQLException e) {
-            System.err.println("Azure SQL connection test failed: " + e.getMessage());
+            System.err.println("Azure SQL connection failed: " + e.getMessage());
             return false;
         }
     }
 
-    public int insert(long id, String data) throws SQLException {
-        String sql = "INSERT INTO " + tableName + " "
-                + "(id, data, create_timestamp, create_timestamp_unix, update_timestamp, update_timestamp_unix) "
-                + "VALUES (?, ?, ?, ?, ?, ?)";
+    // CRUD
+
+    public Long insert(String data) throws SQLException {
+
+        // The end of this SQL statement is partially cut off in the image.
+        String sql = "INSERT INTO dbo.RDI_TEST (data, create_timestamp, create_timestamp_unix, update_timestamp, update_timestamp_unix) "
+                + "VALUES (?, ?, ?, ?, ?)";
+
         Instant now = Instant.now();
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            bindInsert(ps, id, data, now);
-            return ps.executeUpdate();
+        Timestamp timestamp = Timestamp.from(now);
+        Long unixTimestamp = now.getEpochSecond();
+
+        try (Connection connection = client.getConnection();
+             PreparedStatement statement =
+                     connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+
+            statement.setString(1, data);
+            statement.setTimestamp(2, timestamp);
+            statement.setLong(3, unixTimestamp);
+            statement.setTimestamp(4, timestamp);
+            statement.setLong(5, unixTimestamp);
+
+            statement.executeUpdate();
+
+            try (ResultSet generatedKeys = statement.getGeneratedKeys()) {
+                if (generatedKeys.next()) {
+                    return generatedKeys.getLong(1);
+                } else {
+                    throw new SQLException(
+                            "Creating record failed, no ID obtained."
+                    );
+                }
+            }
         }
     }
 
-    public int update(long id, String data) throws SQLException {
-        String sql = "UPDATE " + tableName
-                + " SET data = ?, update_timestamp = ?, update_timestamp_unix = ? WHERE id = ?";
+    public void update(Long id, String data) throws SQLException {
+
+        String sql = "UPDATE dbo.RDI_TEST SET data = ?, update_timestamp = ?, update_timestamp_unix = ? WHERE id = ?";
+
         Instant now = Instant.now();
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setString(1, data);
-            ps.setTimestamp(2, Timestamp.from(now));
-            ps.setLong(3, now.toEpochMilli());
-            ps.setLong(4, id);
-            int rows = ps.executeUpdate();
-            if (rows != 1) throw new SQLException("UPDATE expected 1 row for id=" + id + ", got " + rows);
-            return rows;
-        }
-    }
+        Timestamp timestamp = Timestamp.from(now);
+        Long unixTimestamp = now.getEpochSecond();
 
-    public int delete(long id) throws SQLException {
-        String sql = "DELETE FROM " + tableName + " WHERE id = ?";
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setLong(1, id);
-            int rows = ps.executeUpdate();
-            if (rows != 1) throw new SQLException("DELETE expected 1 row for id=" + id + ", got " + rows);
-            return rows;
-        }
-    }
+        try (Connection connection = client.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
 
-    public void batchInsert(List<SqlTestRecord> records) throws SQLException {
-        String sql = "INSERT INTO " + tableName
-                + " (id, data, create_timestamp, create_timestamp_unix, update_timestamp, update_timestamp_unix) "
-                + "VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            for (SqlTestRecord record : records) {
-                bindInsert(ps, record.id(), record.data(), Instant.now());
-                ps.addBatch();
-            }
-            ps.executeBatch();
-        }
-    }
+            statement.setString(1, data);
+            statement.setTimestamp(2, timestamp);
+            statement.setLong(3, unixTimestamp);
+            statement.setLong(4, id);
 
-    public void batchUpdate(List<SqlTestRecord> records) throws SQLException {
-        String sql = "UPDATE " + tableName
-                + " SET data = ?, update_timestamp = ?, update_timestamp_unix = ? WHERE id = ?";
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            for (SqlTestRecord record : records) {
-                Instant now = Instant.now();
-                ps.setString(1, record.data());
-                ps.setTimestamp(2, Timestamp.from(now));
-                ps.setLong(3, now.toEpochMilli());
-                ps.setLong(4, record.id());
-                ps.addBatch();
-            }
-            int[] counts = ps.executeBatch();
-            checkBatchCounts(counts, records.size(), "UPDATE");
-        }
-    }
+            int rows = statement.executeUpdate();
 
-    public void batchDelete(List<SqlTestRecord> records) throws SQLException {
-        String sql = "DELETE FROM " + tableName + " WHERE id = ?";
-        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            for (SqlTestRecord record : records) {
-                ps.setLong(1, record.id());
-                ps.addBatch();
-            }
-            int[] counts = ps.executeBatch();
-            checkBatchCounts(counts, records.size(), "DELETE");
-        }
-    }
-
-    private static void bindInsert(PreparedStatement ps, long id, String data, Instant now) throws SQLException {
-        ps.setLong(1, id);
-        ps.setString(2, data);
-        ps.setTimestamp(3, Timestamp.from(now));
-        ps.setLong(4, now.toEpochMilli());
-        ps.setTimestamp(5, Timestamp.from(now));
-        ps.setLong(6, now.toEpochMilli());
-    }
-
-    private static void checkBatchCounts(int[] counts, int expected, String operation) throws SQLException {
-        if (counts.length != expected) {
-            throw new SQLException(operation + " batch returned " + counts.length + " counts; expected " + expected);
-        }
-        for (int i = 0; i < counts.length; i++) {
-            if (counts[i] == 0) throw new SQLException(operation + " batch affected no row at index " + i);
-            if (counts[i] < 0 && counts[i] != PreparedStatement.SUCCESS_NO_INFO) {
-                throw new SQLException(operation + " batch failed at index " + i + " with code " + counts[i]);
+            if (rows == 0) {
+                throw new SQLException("No record found for id = " + id);
             }
         }
     }
 
-    public record SqlTestRecord(long id, String data) {}
+    public void delete(Long id) throws SQLException {
+
+        String sql = "DELETE FROM dbo.RDI_TEST WHERE id = ?";
+
+        try (Connection connection = client.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setLong(1, id);
+
+            statement.executeUpdate();
+        }
+    }
+
+    // The remaining methods are below the visible portion of the images.
 }
