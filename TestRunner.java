@@ -1,189 +1,203 @@
-package com.cibc.main.test;
 
-import com.cibc.main.config.Config;
-import com.cibc.main.redis.RedisClientWrapper;
-import com.cibc.main.sql.SqlServerClientWrapper;
-import com.cibc.main.sql.SqlServerClientWrapper.SqlTestRecord;
+package com.cibc.main;
 
-import java.sql.SQLException;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
+import com.cibc.main.SqlServerClientWrapper;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.LockSupport;
 
-public final class TestRunner {
-    private final SqlServerClientWrapper sql;
-    private final RedisClientWrapper redis;
-    private final String keyPrefix;
-    private final long timeoutNanos;
-    private final long pollIntervalNanos;
+import com.cibc.main.config.Config;
+import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
+import io.lettuce.core.ClientOptions;
+import io.lettuce.core.RedisBusyException;
 
-    public TestRunner(SqlServerClientWrapper sql, RedisClientWrapper redis, Config config) {
-        this.sql = sql;
-        this.redis = redis;
-        this.keyPrefix = config.getRedisKeyPrefix();
-        this.timeoutNanos = Duration.ofMillis(config.getRedisTimeoutMillis()).toNanos();
-        this.pollIntervalNanos = Duration.ofMillis(config.getPollIntervalMillis()).toNanos();
-        if (timeoutNanos <= 0 || pollIntervalNanos <= 0) {
-            throw new IllegalArgumentException("Redis timeout and polling interval must be positive.");
-        }
+public class TestRunner {
+    private static final Duration REDIS_TIMEOUT = Duration.ofSeconds(10000);
+    private static final long POLL_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+
+    private final SqlServerClientWrapper sqlClient;
+    private final RedisClientWrapper redisClient;
+
+    public TestRunner(SqlServerClientWrapper sqlClient, RedisClientWrapper redisClient) {
+        this.sqlClient = sqlClient;
+        this.redisClient = redisClient;
     }
 
-    public List<TestResult> runSingleCrudCycle(long id, String runId) {
+    public List<TestResult> runSingles() throws InterruptedException, ExecutionException {
+        List<TestResult> inserts = new ArrayList<>();
         List<TestResult> results = new ArrayList<>();
-        results.add(runSingle("INSERT", id, "insert-" + runId + "-" + id, runId));
-        // Only update/delete rows that the preceding INSERT succeeded in creating.
-        if (results.get(0).success()) {
-            results.add(runSingle("UPDATE", id, "update-" + runId + "-" + id, runId));
-            if (results.get(1).success()) results.add(runSingle("DELETE", id, null, runId));
+        String runId = UUID.randomUUID().toString();
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        List<Future<TestResult>> futures = new ArrayList<>();
+
+        System.out.println("Running Inserts...");
+        for (int i = 0; i < 10; i++) {
+            futures.add(executor.submit(() -> runSingle(runId, "INSERT", null, "insert-" + runId + "-" )));
         }
+
+        for (Future<TestResult> future : futures) {
+            inserts.add(future.get());
+        }
+
+        System.out.println("Running Updates...");
+        for (TestResult insert : inserts) {
+            futures.add(executor.submit(() -> runSingle(runId, "UPDATE", insert.recordId(), "update-" + runId + "-" )));
+        }
+
+        for (Future<TestResult> future : futures) {
+            results.add(future.get());
+        }
+
+        executor.shutdown();
+
         return results;
     }
 
-    public List<TestResult> runBatchCrudCycle(List<Long> ids, String runId) {
-        if (ids.isEmpty()) return List.of();
-        String batchId = UUID.randomUUID().toString();
-        int size = ids.size();
-        List<TestResult> results = new ArrayList<>(size * 3);
-        List<SqlTestRecord> inserts = ids.stream()
-                .map(id -> new SqlTestRecord(id, "insert-" + runId + "-" + id)).toList();
+    // Insert test
+    public TestResult runSingle(String runId, String operation, Long id, String data) {
+        long totalStart = System.currentTimeMillis();
 
-        long totalStart = System.nanoTime();
-        long sqlStart = System.nanoTime();
         try {
-            sql.batchInsert(inserts);
-            long sqlDuration = System.nanoTime() - sqlStart;
-            long propagationStart = System.nanoTime();
-            for (int i = 0; i < inserts.size(); i++) {
-                SqlTestRecord record = inserts.get(i);
-                results.add(awaitResult(runId, "INSERT", "BATCH", batchId, size, record.id(),
-                        record.data(), false, sqlDuration, i == 0, totalStart, propagationStart));
-            }
-        } catch (Exception e) {
-            long elapsed = System.nanoTime() - totalStart;
-            for (int i = 0; i < inserts.size(); i++) {
-                results.add(failure(runId, "INSERT", "BATCH", batchId, size, inserts.get(i).id(),
-                        elapsed, i == 0 ? elapsed : 0, e));
-            }
-            return results;
-        }
+            long sqlStart = System.currentTimeMillis();
 
-        List<SqlTestRecord> updates = ids.stream()
-                .map(id -> new SqlTestRecord(id, "update-" + runId + "-" + id)).toList();
-        totalStart = System.nanoTime();
-        sqlStart = System.nanoTime();
-        try {
-            sql.batchUpdate(updates);
-            long sqlDuration = System.nanoTime() - sqlStart;
-            long propagationStart = System.nanoTime();
-            for (int i = 0; i < updates.size(); i++) {
-                SqlTestRecord record = updates.get(i);
-                results.add(awaitResult(runId, "UPDATE", "BATCH", batchId, size, record.id(),
-                        record.data(), false, sqlDuration, i == 0, totalStart, propagationStart));
-            }
-        } catch (Exception e) {
-            long elapsed = System.nanoTime() - totalStart;
-            for (int i = 0; i < updates.size(); i++) {
-                results.add(failure(runId, "UPDATE", "BATCH", batchId, size, updates.get(i).id(),
-                        elapsed, i == 0 ? elapsed : 0, e));
-            }
-            return results;
-        }
-
-        totalStart = System.nanoTime();
-        sqlStart = System.nanoTime();
-        try {
-            sql.batchDelete(ids.stream().map(id -> new SqlTestRecord(id, "")).toList());
-            long sqlDuration = System.nanoTime() - sqlStart;
-            long propagationStart = System.nanoTime();
-            for (int i = 0; i < ids.size(); i++) {
-                results.add(awaitResult(runId, "DELETE", "BATCH", batchId, size, ids.get(i),
-                        null, true, sqlDuration, i == 0, totalStart, propagationStart));
-            }
-        } catch (Exception e) {
-            long elapsed = System.nanoTime() - totalStart;
-            for (int i = 0; i < ids.size(); i++) {
-                results.add(failure(runId, "DELETE", "BATCH", batchId, size, ids.get(i),
-                        elapsed, i == 0 ? elapsed : 0, e));
-            }
-        }
-        return results;
-    }
-
-    private TestResult runSingle(String operation, long id, String value, String runId) {
-        String batchId = UUID.randomUUID().toString();
-        long totalStart = System.nanoTime();
-        long sqlDuration = 0;
-        try {
-            long sqlStart = System.nanoTime();
             switch (operation) {
-                case "INSERT" -> sql.insert(id, value);
-                case "UPDATE" -> sql.update(id, value);
-                case "DELETE" -> sql.delete(id);
+                case "INSERT" -> id = sqlClient.insert(data);
+                case "UPDATE" -> sqlClient.update(id, data);
+                case "DELETE" -> sqlClient.delete(id);
                 default -> throw new IllegalArgumentException("Unsupported operation: " + operation);
             }
-            sqlDuration = System.nanoTime() - sqlStart;
-            long propagationStart = System.nanoTime();
-            return awaitResult(runId, operation, "SINGLE", batchId, 1, id, value,
-                    "DELETE".equals(operation), sqlDuration, true, totalStart, propagationStart);
-        } catch (Exception e) {
-            return failure(runId, operation, "SINGLE", batchId, 1, id,
-                    System.nanoTime() - totalStart, sqlDuration, e);
-        }
-    }
 
-    private TestResult awaitResult(String runId, String operation, String mode, String batchId,
-                                   int batchSize, long id, String expectedValue, boolean expectMissing,
-                                   long sqlDuration, boolean includeSqlSample, long totalStart,
-                                   long propagationStart) {
-        long deadline = propagationStart + timeoutNanos;
-        int attempts = 0;
-        try {
-            String key = keyPrefix + id;
-            while (System.nanoTime() < deadline) {
-                attempts++;
-                boolean matched;
-                if (expectMissing) {
-                    matched = !redis.exists(key);
-                } else {
-                    matched = expectedValue != null && expectedValue.equals(redis.read(key));
-                }
-                if (matched) {
-                    long propagation = System.nanoTime() - propagationStart;
-                    return new TestResult(runId, Instant.now(), operation, mode, batchId, batchSize, id,
-                            includeSqlSample ? sqlDuration : 0, propagation,
-                            System.nanoTime() - totalStart, attempts, true, false, null);
-                }
-                LockSupport.parkNanos(pollIntervalNanos);
-                if (Thread.currentThread().isInterrupted()) {
-                    Thread.currentThread().interrupt();
-                    throw new InterruptedException("Interrupted while polling Redis");
-                }
+            double sqlDuration = System.currentTimeMillis() - sqlStart;
+            System.out.println(operation + " operation successfully executed in Azure: " + id);
+
+            String redisKey = buildRedisKey(id);
+
+            // Wait for Redis
+            long redisStart = System.currentTimeMillis();
+
+            if (operation == "UPDATE") {
+                waitForRedisPropagation(operation, redisKey, data);
+            } else {
+                waitForRedisPropagation(operation, redisKey);
             }
-            throw new RedisTimeoutException("Redis did not reach the expected state within "
-                    + Duration.ofNanos(timeoutNanos).toMillis() + " ms");
+
+            double redisPropDuration = System.currentTimeMillis() - redisStart;
+            double totalDuration = System.currentTimeMillis() - totalStart;
+
+            TestResult testResult = new TestResult(
+                    runId,
+                    Instant.now(),
+                    operation,
+                    "single",
+                    id,
+                    1,
+                    sqlDuration,
+                    redisPropDuration,
+                    totalDuration,
+                    true,
+                    false,
+                    null
+            );
+
+            return testResult;
+
         } catch (Exception e) {
-            return new TestResult(runId, Instant.now(), operation, mode, batchId, batchSize, id,
-                    includeSqlSample ? sqlDuration : 0, System.nanoTime() - propagationStart,
-                    System.nanoTime() - totalStart, attempts, false,
-                    e instanceof RedisTimeoutException, e.getMessage());
+            return new TestResult(
+                    runId,
+                    Instant.now(),
+                    operation,
+                    "single",
+                    null,
+                    1,
+                    0,
+                    0,
+                    (System.currentTimeMillis() - totalStart) / 1_000_000_000.0,
+                    false,
+                    e instanceof RedisTimeoutException,
+                    e.getMessage()
+            );
         }
     }
 
-    private TestResult failure(String runId, String operation, String mode, String batchId,
-                               int batchSize, long id, long totalNanos, long sqlNanos, Exception e) {
-        return new TestResult(runId, Instant.now(), operation, mode, batchId, batchSize, id,
-                sqlNanos, 0, totalNanos, 0, false, false, message(e));
+    private void waitForRedisPropagation(String operation, String key) throws RedisTimeoutException {
+        long deadline = System.nanoTime() + REDIS_TIMEOUT.toNanos();
+
+        if (operation == "INSERT") {
+            System.out.println("Waiting for key " + key + " to appear in Redis...");
+        } else {
+            System.out.println("Waiting for key " + key + " to disappear from Redis...");
+        }
+
+        while (System.nanoTime() < deadline) {
+            boolean appears = redisClient.exists(key);
+
+            if (operation == "INSERT" && appears) {
+                return;
+            } else if (operation == "DELETE" && !appears) {
+                return;
+            }
+
+            LockSupport.parkNanos(POLL_INTERVAL_NANOS);
+        }
+
+        throw new RedisTimeoutException(
+                "Redis did not reflect change within " + REDIS_TIMEOUT.toSeconds() + "seconds"
+        );
     }
 
-    private static String message(Exception e) {
-        String message = e.getMessage();
-        return e.getClass().getSimpleName() + (message == null ? "" : ": " + message);
+    private void waitForRedisPropagation(String operation, String key, String data) throws RedisTimeoutException {
+        long deadline = System.nanoTime() + REDIS_TIMEOUT.toNanos();
+
+        System.out.println("Waiting for redis to reflect change on key " + key);
+
+        while (System.nanoTime() < deadline) {
+            List<Object> newData = redisClient.readData(key);
+
+            String newDataStr = newData.stream()
+                    .map(Object obj -> obj.toString())
+                    .findFirst() // Get the first element as a string
+                    .orElse("").replaceAll("\"", "");
+
+            if (newDataStr.equals(data)) {
+                return;
+            }
+
+            LockSupport.parkNanos(POLL_INTERVAL_NANOS);
+        }
+
+        throw new RedisTimeoutException(
+                "Redis did not reflect change within " + REDIS_TIMEOUT.toSeconds() + "seconds"
+        );
     }
 
+    // Key formatting
+    private String buildRedisKey(long id) {
+        return "rdi_test:id:" + id;
+    }
+
+    // Custom exception
     private static final class RedisTimeoutException extends Exception {
-        private RedisTimeoutException(String message) { super(message); }
+        private RedisTimeoutException(String message) {
+            super(message);
+        }
+    }
+
+    public static TestRunner create() throws Exception {
+        Config config = new Config();
+
+        ClientFactory factory = new ClientFactory(config);
+
+        RedisClientWrapper redisClientWrapper = new RedisClientWrapper(factory.createRedisClient());
+        SQLServerDataSource sqlDataSource = factory.createAzureSqlClient();
+
+        SqlServerClientWrapper sqlServerClientWrapper = new SqlServerClientWrapper(sqlDataSource);
+
+        return new TestRunner(sqlServerClientWrapper, redisClientWrapper);
     }
 }
