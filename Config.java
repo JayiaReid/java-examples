@@ -1,101 +1,198 @@
-package com.cibc.main.config;
 
-import io.lettuce.core.ClientOptions;
+import com.microsoft.sqlserver.jdbc.SQLServerXADataSource;
 import io.lettuce.core.RedisURI;
-import io.lettuce.core.SslOptions;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Path;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.sync.RedisCommands;
+import io.lettuce.core.*;
+import io.netty.handler.ssl.*;
+import java.io.*;
 import java.util.Properties;
 
-public final class Config {
-    private static final String CONFIG_FILE = "/config/credentials.properties";
-    private final Properties properties = new Properties();
-    private final ClientOptions clientOptions;
+public class Config {
 
-    public Config() throws IOException {
-        try (InputStream input = Config.class.getResourceAsStream(CONFIG_FILE)) {
+    private final Properties properties;
+    private final String redisHost;
+    private final int redisPort;
+    private final String redisUsername;
+    private final String redisPassword;
+
+    // Azure SQL
+    private final String azureServerName;
+    private final int azurePort;
+    private final String azureDatabase;
+    private final String azureUsername;
+    private final String azurePassword;
+    private final String azureEncrypt;
+    private final boolean azureTrustServerCert;
+
+    // SPN
+    private final String azureSpn;
+    private final String azureStsUrl;
+    private final String azureClientId;
+    private final String azureClientCertPath;
+    private final String azureClientCertPassword;
+    private final String azureTruststore;
+    private final String azureTrustStorePassword;
+
+    private final boolean enableSsl;
+    private final String truststorePassword;
+    private final String trustStorePath;
+
+    public final ClientOptions clientOptions;
+
+    private final String CONFIG_FILE = "/config/credentials.properties";
+
+    public Config() throws Exception {
+        properties = new Properties();
+
+        try (InputStream input =
+                     getClass().getResourceAsStream(CONFIG_FILE)) {
+
             if (input == null) {
-                throw new IOException("Could not find " + CONFIG_FILE
-                        + ". Copy credentials.properties.example to credentials.properties.");
+                throw new IOException(
+                    "Could not find configuration file: " + CONFIG_FILE
+                );
             }
+
             properties.load(input);
         }
-        clientOptions = createRedisClientOptions();
+
+        // Redis
+        redisHost = properties.getProperty("redis.host");
+        redisPort = Integer.parseInt(
+            properties.getProperty("redis.port")
+        );
+        redisUsername = properties.getProperty("redis.username");
+        redisPassword = properties.getProperty("redis.password");
+
+        // Azure SQL
+        azureServerName = properties.getProperty("azure.serverName");
+        azurePort = Integer.parseInt(
+            properties.getProperty("azure.port")
+        );
+        azureDatabase = properties.getProperty("azure.databaseName");
+
+        azureUsername = properties.getProperty("azure.username");
+        azurePassword = properties.getProperty("azure.password");
+        azureEncrypt = properties.getProperty("azure.setEncrypt");
+        azureTrustServerCert = Boolean.parseBoolean(
+            properties.getProperty("azure.setTrustServerCert")
+        );
+
+        // SPN
+        azureSpn = properties.getProperty("azure.spn");
+        azureStsUrl = properties.getProperty("azure.stsUrl");
+        azureClientId = properties.getProperty("azure.clientId");
+        azureClientCertPath =
+            properties.getProperty("azure.clientCertPath");
+        azureClientCertPassword =
+            properties.getProperty("azure.clientCertPassword");
+        azureTruststore = properties.getProperty("azure.truststore");
+        azureTrustStorePassword =
+            properties.getProperty("azure.truststorePassword");
+
+        trustStorePath = properties.getProperty("truststore.path");
+        truststorePassword = properties.getProperty("truststore.password");
+
+        enableSsl = Boolean.parseBoolean(
+            properties.getProperty("enable.ssl")
+        );
+
+        clientOptions = setUpClientOptions();
     }
 
-    private String required(String key) {
-        String value = properties.getProperty(key);
+    private String required(String property) {
+        String value = properties.getProperty(property);
+
         if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException("Missing required configuration property: " + key);
+            throw new IllegalArgumentException(
+                "Missing required configuration property: " + property
+            );
         }
-        return value.trim();
+
+        return value;
     }
 
-    public String getSourceServer() { return required("source.server"); }
-    public int getSourcePort() { return Integer.parseInt(required("source.port")); }
-    public String getSourceDatabase() { return required("source.databaseName"); }
-    public boolean isSourceEncrypt() { return Boolean.parseBoolean(properties.getProperty("source.encrypt", "true")); }
-    public boolean isSourceTrustServerCertificate() {
-        return Boolean.parseBoolean(properties.getProperty("source.trustServerCertificate", "false"));
-    }
-    public String getTenantId() { return required("azure.tenantId"); }
-    public String getClientId() { return required("azure.clientId"); }
-    public String getClientSecret() { return required("azure.clientSecret"); }
+    // Redis client
+    private ClientOptions setUpClientOptions()
+            throws FileNotFoundException {
 
-    public String getTargetHost() { return required("target.host"); }
-    public int getTargetPort() { return Integer.parseInt(required("target.port")); }
-    public String getTargetUsername() { return properties.getProperty("target.username", "").trim(); }
-    public String getTargetPassword() { return properties.getProperty("target.password", "").trim(); }
-    public boolean isTargetSsl() { return Boolean.parseBoolean(properties.getProperty("target.ssl", "true")); }
-    public ClientOptions getClientOptions() { return clientOptions; }
+        SslOptions sslOptions = SslOptions.builder()
+            .jdkSslProvider()
+            .truststore(new File(trustStorePath), truststorePassword)
+            .build();
 
-    public RedisURI getTargetUri() {
-        RedisURI.Builder builder = RedisURI.builder()
-                .withHost(getTargetHost())
-                .withPort(getTargetPort());
-        if (isTargetSsl()) builder.withSsl(true);
-
-        String username = getTargetUsername();
-        String password = getTargetPassword();
-        if (!username.isBlank()) {
-            if (password.isBlank()) throw new IllegalArgumentException("Redis password is required when username is configured.");
-            builder.withAuthentication(username, password);
-        } else if (!password.isBlank()) {
-            builder.withPassword(password.toCharArray());
-        }
-        return builder.build();
+        return ClientOptions.builder()
+            .sslOptions(sslOptions)
+            .build();
     }
 
-    public String getTableName() {
-        String table = properties.getProperty("test.tableName", "dbo.RDI_TEST").trim();
-        // Restrict this configurable SQL identifier to a simple schema.table form.
-        if (!table.matches("[A-Za-z0-9_]+\\.[A-Za-z0-9_]+")) {
-            throw new IllegalArgumentException("test.tableName must look like dbo.RDI_TEST");
-        }
-        return table;
+    public ClientOptions getClientOptions() {
+        return clientOptions;
     }
-    public String getRedisKeyPrefix() { return properties.getProperty("test.redisKeyPrefix", "rdi_test:id:").trim(); }
-    public long getRedisTimeoutMillis() { return Long.parseLong(properties.getProperty("test.redisTimeoutMillis", "10000")); }
-    public long getPollIntervalMillis() { return Long.parseLong(properties.getProperty("test.pollIntervalMillis", "5")); }
-    public int getRecordsPerBatch() { return Integer.parseInt(properties.getProperty("test.recordsPerBatch", "25")); }
-    public int getSingleRecords() { return Integer.parseInt(properties.getProperty("test.singleRecords", "3")); }
-    public int getBatchRecords() { return Integer.parseInt(properties.getProperty("test.batchRecords", "25")); }
-    public String getOutputFile() { return properties.getProperty("test.outputFile", "output/rdi-performance.xlsx").trim(); }
 
-    private ClientOptions createRedisClientOptions() {
-        String trustStorePath = properties.getProperty("truststore.path", "").trim();
-        String trustStorePassword = properties.getProperty("truststore.password", "");
-        if (trustStorePath.isBlank()) return ClientOptions.builder().build();
-        try {
-            SslOptions sslOptions = SslOptions.builder()
-                    .jdkSslProvider()
-                    .truststore(Path.of(trustStorePath), trustStorePassword)
-                    .build();
-            return ClientOptions.builder().sslOptions(sslOptions).build();
-        } catch (Exception e) {
-            throw new IllegalStateException("Unable to configure Redis SSL truststore", e);
-        }
+    public RedisURI getRedisUri() {
+        return RedisURI.Builder
+            .redis(redisHost, redisPort)
+            .withSsl(enableSsl)
+            .withAuthentication(redisUsername, redisPassword)
+            .build();
+    }
+
+    // Azure getters
+    public String getAzureServer() {
+        return azureServerName;
+    }
+
+    public Integer getAzurePort() {
+        return azurePort;
+    }
+
+    public String getAzureDatabase() {
+        return azureDatabase;
+    }
+
+    public String getAzureUsername() {
+        return azureUsername;
+    }
+
+    public String getAzurePassword() {
+        return azurePassword;
+    }
+
+    public String getAzureEncrypt() {
+        return azureEncrypt;
+    }
+
+    public Boolean getAzureTrustServerCert() {
+        return azureTrustServerCert;
+    }
+
+    public String getAzureSpn() {
+        return azureSpn;
+    }
+
+    public String getAzureClientId() {
+        return azureClientId;
+    }
+
+    public String getAzureStsUrl() {
+        return azureStsUrl;
+    }
+
+    public String getAzureClientCertPath() {
+        return azureClientCertPath;
+    }
+
+    public String getAzureClientCertPassword() {
+        return azureClientCertPassword;
+    }
+
+    public String getAzureTruststore() {
+        return azureTruststore;
+    }
+
+    public String getAzureTrustStorePassword() {
+        return azureTrustStorePassword;
     }
 }
