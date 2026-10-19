@@ -1,0 +1,443 @@
+import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.*;
+
+public class InsertLoadTest {
+
+    private static final String INSERT_SQL = """
+        INSERT INTO dbo.INSERT_LOAD_TEST (id, data)
+        VALUES (?, ?)
+        """;
+
+    private static final int QUERY_TIMEOUT_SECONDS = 30;
+
+    public record TestRow(long id, String data) {}
+
+    public record InsertResult(
+        long id,
+        long startedNanos,
+        long commitAcknowledgedNanos,
+        long finishedNanos,
+        String sqlError,
+        String cleanupError
+    ) {
+        public boolean successful() {
+            return commitAcknowledgedNanos != 0;
+        }
+
+        // Includes waiting to borrow a connection and SQL execution.
+        // Excludes waiting in the executor queue.
+        public double requestMillis() {
+            long end = successful()
+                ? commitAcknowledgedNanos
+                : finishedNanos;
+
+            return (end - startedNanos) / 1_000_000.0;
+        }
+    }
+
+    public record TestReport(
+        int requested,
+        int concurrency,
+        long elapsedNanos,
+        List<InsertResult> results
+    ) {
+        public long successful() {
+            return results.stream()
+                .filter(InsertResult::successful)
+                .count();
+        }
+
+        public double elapsedSeconds() {
+            return elapsedNanos / 1_000_000_000.0;
+        }
+
+        public double insertsPerSecond() {
+            return successful() / elapsedSeconds();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+
+        // Usage: InsertLoadTest [recordCount] [concurrency] [firstId]
+        int recordCount = args.length > 0
+            ? Integer.parseInt(args[0]) : 10_000;
+
+        int concurrency = args.length > 1
+            ? Integer.parseInt(args[1]) : 50;
+
+        // Supply an explicit unused range when running multiple generators.
+        long firstId = args.length > 2
+            ? Long.parseLong(args[2])
+            : Math.multiplyExact(System.currentTimeMillis(), 1_000_000L);
+
+        if (recordCount <= 0 || concurrency <= 0) {
+            throw new IllegalArgumentException(
+                "recordCount and concurrency must be positive"
+            );
+        }
+
+        // Generate payloads before timing starts.
+        List<TestRow> rows = prepareRows(recordCount, firstId);
+
+        try (HikariDataSource pool = createPool(concurrency)) {
+
+            System.out.println("Warming SQL connections...");
+            warmPool(pool, concurrency);
+
+            System.out.printf(
+                "Starting %,d inserts with %d workers. First ID: %d%n",
+                recordCount, concurrency, firstId
+            );
+
+            TestReport report = runTest(pool, rows, concurrency);
+
+            printReport(report);
+
+            // report.results() retains per-record timestamps.
+            // A future Redis observer can correlate records by ID.
+        }
+    }
+
+    public static HikariDataSource createPool(int poolSize) {
+
+        SQLServerDataSource sql = new SQLServerDataSource();
+
+        // Use your existing working JDBC connection properties.
+        sql.setURL(requiredEnv("SQL_JDBC_URL"));
+
+        // Optional: credentials can instead be supplied through your
+        // existing authentication configuration.
+        String user = System.getenv("SQL_USER");
+        String password = System.getenv("SQL_PASSWORD");
+
+        if (user != null && !user.isBlank()) {
+            sql.setUser(user);
+        }
+
+        if (password != null) {
+            sql.setPassword(password);
+        }
+
+        sql.setLoginTimeout(30);
+
+        // Milliseconds. Bounds stalled network reads.
+        sql.setSocketTimeout(60_000);
+
+        HikariConfig config = new HikariConfig();
+        config.setPoolName("InsertLoadPool");
+        config.setDataSource(sql);
+
+        config.setMaximumPoolSize(poolSize);
+        config.setMinimumIdle(poolSize);
+
+        config.setAutoCommit(true);
+        config.setConnectionTimeout(30_000);
+        config.setValidationTimeout(5_000);
+
+        return new HikariDataSource(config);
+    }
+
+    public static List<TestRow> prepareRows(
+        int count,
+        long firstId
+    ) {
+        List<TestRow> rows = new ArrayList<>(count);
+
+        for (int i = 0; i < count; i++) {
+            long id = Math.addExact(firstId, i);
+            rows.add(new TestRow(id, "test-record-" + id));
+        }
+
+        return List.copyOf(rows);
+    }
+
+    public static void warmPool(
+        DataSource dataSource,
+        int connectionCount
+    ) throws SQLException {
+
+        List<Connection> connections =
+            new ArrayList<>(connectionCount);
+
+        try {
+            // Hold the connections so each borrow warms a separate
+            // physical connection rather than reusing the same one.
+            for (int i = 0; i < connectionCount; i++) {
+                Connection connection = dataSource.getConnection();
+                connections.add(connection);
+
+                try (PreparedStatement statement =
+                         connection.prepareStatement("SELECT 1")) {
+                    statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
+
+                    try (var resultSet = statement.executeQuery()) {
+                        if (!resultSet.next()
+                                || resultSet.getInt(1) != 1) {
+                            throw new SQLException(
+                                "Connection warm-up failed"
+                            );
+                        }
+                    }
+                }
+            }
+
+        } finally {
+            SQLException failure = null;
+
+            for (Connection connection : connections) {
+                try {
+                    connection.close();
+                } catch (SQLException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    public static TestReport runTest(
+        DataSource dataSource,
+        List<TestRow> rows,
+        int concurrency
+    ) throws InterruptedException, ExecutionException {
+
+        if (rows.isEmpty() || concurrency <= 0) {
+            throw new IllegalArgumentException(
+                "Rows must not be empty; concurrency must be positive"
+            );
+        }
+
+        ThreadPoolExecutor executor =
+            (ThreadPoolExecutor)
+                Executors.newFixedThreadPool(concurrency);
+
+        CountDownLatch startGate = new CountDownLatch(1);
+
+        List<Future<InsertResult>> futures =
+            new ArrayList<>(rows.size());
+
+        try {
+            executor.prestartAllCoreThreads();
+
+            // Prepare the complete workload before releasing workers.
+            for (TestRow row : rows) {
+                futures.add(executor.submit(() -> {
+                    startGate.await();
+                    return insertOne(dataSource, row);
+                }));
+            }
+
+            long start = System.nanoTime();
+            startGate.countDown();
+
+            List<InsertResult> results =
+                new ArrayList<>(rows.size());
+
+            long lastFinished = start;
+
+            for (Future<InsertResult> future : futures) {
+                InsertResult result = future.get();
+
+                results.add(result);
+                lastFinished = Math.max(
+                    lastFinished,
+                    result.finishedNanos()
+                );
+            }
+
+            return new TestReport(
+                rows.size(),
+                concurrency,
+                lastFinished - start,
+                List.copyOf(results)
+            );
+
+        } finally {
+            for (Future<InsertResult> future : futures) {
+                if (!future.isDone()) {
+                    future.cancel(true);
+                }
+            }
+
+            executor.shutdownNow();
+
+            // JDBC cancellation is best effort; configured database
+            // and socket timeouts also limit stalled calls.
+            if (!executor.awaitTermination(65, TimeUnit.SECONDS)) {
+                System.err.println(
+                    "Some JDBC tasks are still terminating."
+                );
+            }
+        }
+    }
+
+    public static InsertResult insertOne(
+        DataSource dataSource,
+        TestRow row
+    ) {
+        long started = System.nanoTime();
+        long committed = 0;
+
+        String sqlError = null;
+        String cleanupError = null;
+
+        try (Connection connection = dataSource.getConnection()) {
+
+            // The pool is configured with autoCommit=true.
+            try (PreparedStatement statement =
+                     connection.prepareStatement(INSERT_SQL)) {
+
+                statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
+                statement.setLong(1, row.id());
+                statement.setString(2, row.data());
+
+                statement.executeUpdate();
+
+                // With autoCommit=true, successful execution
+                // acknowledges this individual insert's commit.
+                committed = System.nanoTime();
+            }
+
+        } catch (SQLException e) {
+            String detail = "SQLState=" + e.getSQLState()
+                + ", code=" + e.getErrorCode()
+                + ", message=" + e.getMessage();
+
+            if (committed == 0) {
+                sqlError = detail;
+            } else {
+                // The insert succeeded, but resource cleanup failed.
+                cleanupError = detail;
+            }
+        }
+
+        return new InsertResult(
+            row.id(),
+            started,
+            committed,
+            System.nanoTime(),
+            sqlError,
+            cleanupError
+        );
+    }
+
+    public static void printReport(TestReport report) {
+
+        long successful = report.successful();
+
+        double[] durations = report.results().stream()
+            .filter(InsertResult::successful)
+            .mapToDouble(InsertResult::requestMillis)
+            .sorted()
+            .toArray();
+
+        double average = Arrays.stream(durations)
+            .average()
+            .orElse(Double.NaN);
+
+        System.out.printf("""
+            
+            Requested:           %,d
+            Concurrent workers:  %,d
+            Successful:          %,d
+            Failed/unconfirmed:  %,d
+            Total time:          %.3f seconds
+            Throughput:          %.1f successful inserts/second
+            Average request:     %.3f ms
+            P95 request:         %.3f ms
+            P99 request:         %.3f ms
+            %n""",
+            report.requested(),
+            report.concurrency(),
+            successful,
+            report.requested() - successful,
+            report.elapsedSeconds(),
+            report.insertsPerSecond(),
+            average,
+            percentile(durations, 0.95),
+            percentile(durations, 0.99)
+        );
+
+        report.results().stream()
+            .filter(r -> r.sqlError() != null
+                      || r.cleanupError() != null)
+            .limit(5)
+            .forEach(r -> System.out.printf(
+                "ID=%d, SQL error=%s, cleanup error=%s%n",
+                r.id(), r.sqlError(), r.cleanupError()
+            ));
+    }
+
+    private static double percentile(
+        double[] sortedValues,
+        double percentile
+    ) {
+        if (sortedValues.length == 0) {
+            return Double.NaN;
+        }
+
+        int index = (int) Math.ceil(
+            percentile * sortedValues.length
+        ) - 1;
+
+        return sortedValues[index];
+    }
+
+    private static String requiredEnv(String name) {
+        String value = System.getenv(name);
+
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(
+                "Missing environment variable: " + name
+            );
+        }
+
+        return value;
+    }
+}
+
+
+
+//Pom.xml
+<properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+</properties>
+
+<dependencies>
+    <dependency>
+        <groupId>com.microsoft.sqlserver</groupId>
+        <artifactId>mssql-jdbc</artifactId>
+        <version>12.8.1.jre11</version>
+    </dependency>
+
+    <dependency>
+        <groupId>com.zaxxer</groupId>
+        <artifactId>HikariCP</artifactId>
+        <version>5.1.0</version>
+    </dependency>
+
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-simple</artifactId>
+        <version>2.0.13</version>
+        <scope>runtime</scope>
+    </dependency>
+</dependencies>
