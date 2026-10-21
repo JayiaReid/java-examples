@@ -9,11 +9,15 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TestRunner {
 
     public static final String SINGLE = "single";
     public static final String BATCH = "batch";
+
+    // Redis read batch size; unrelated to SQL insert batching.
+    private static final int REDIS_READ_BATCH_SIZE = 100;
 
     private final String runId;
     private final SqlServerClientManager sqlClient;
@@ -23,11 +27,17 @@ public class TestRunner {
     private final int recordCount;
     private final int connectionCount;
 
-    // Both configuration values are assumed to be milliseconds.
+    // Configuration values are milliseconds.
     private final long pollInterval;
     private final long redisTimeout;
 
     private final ScheduledThreadPoolExecutor scheduler;
+
+    private final ConcurrentHashMap<Long, PendingRead> pendingReads =
+        new ConcurrentHashMap<>();
+
+    private final AtomicBoolean redisRoundRunning =
+        new AtomicBoolean(false);
 
     private record Row(
         Long id,
@@ -62,6 +72,29 @@ public class TestRunner {
         String operation
     ) {}
 
+    private static final class PendingRead {
+
+        final Long id;
+        final String key;
+        final long committedNanos;
+
+        final CompletableFuture<Metric> result =
+            new CompletableFuture<>();
+
+        long firstCheckNanos;
+        long checks;
+
+        PendingRead(
+            Long id,
+            String key,
+            long committedNanos
+        ) {
+            this.id = id;
+            this.key = key;
+            this.committedNanos = committedNanos;
+        }
+    }
+
     public TestRunner(
         Config config,
         String runId,
@@ -90,10 +123,8 @@ public class TestRunner {
             );
         }
 
-        this.scheduler = new ScheduledThreadPoolExecutor(1);
-
-        // Remove cancelled timeout tasks from the scheduler queue.
-        this.scheduler.setRemoveOnCancelPolicy(true);
+        scheduler = new ScheduledThreadPoolExecutor(1);
+        scheduler.setRemoveOnCancelPolicy(true);
     }
 
     public void run() throws InterruptedException {
@@ -116,17 +147,27 @@ public class TestRunner {
                 System.out.println("Warming SQL connections...");
                 warmPool(pool);
 
-                // Warm the existing Redis connection before timing.
-                // The key does not need to exist.
+                // Warm the existing Redis connection.
                 redisClient.exists(keyPrefix + "__warmup__");
 
                 sqlExecutor.prestartAllCoreThreads();
                 scheduler.prestartAllCoreThreads();
 
+                // Start observing before submitting SQL inserts.
+                ScheduledFuture<?> pollingTask =
+                    scheduler.scheduleWithFixedDelay(
+                        this::pollRedisBatches,
+                        0,
+                        pollInterval,
+                        TimeUnit.MILLISECONDS
+                    );
+
                 System.out.printf(
-                    "Starting %,d inserts with %d SQL workers%n",
+                    "Starting %,d inserts with %d SQL workers; "
+                        + "Redis read batch size=%d%n",
                     recordCount,
-                    connectionCount
+                    connectionCount,
+                    REDIS_READ_BATCH_SIZE
                 );
 
                 long workloadStarted = System.nanoTime();
@@ -142,7 +183,7 @@ public class TestRunner {
                 int successfulInserts = 0;
                 int failedInserts = 0;
 
-                // Redis checks are already running during this wait.
+                // Redis polling continues while waiting for SQL tasks.
                 for (Future<Long> insert : inserts) {
                     try {
                         insert.get();
@@ -151,7 +192,6 @@ public class TestRunner {
                     } catch (ExecutionException e) {
                         failedInserts++;
 
-                        // Print only the first few SQL failures.
                         if (failedInserts <= 5) {
                             System.err.println(
                                 "Insert task failed: " + e.getCause()
@@ -162,8 +202,7 @@ public class TestRunner {
 
                 long sqlFinished = System.nanoTime();
 
-                // All SQL tasks have finished registering their
-                // Redis observation futures.
+                // All SQL tasks have now registered their Redis checks.
                 CompletableFuture<Void> allRedisChecks =
                     CompletableFuture.allOf(
                         redisChecks.toArray(
@@ -175,14 +214,14 @@ public class TestRunner {
                     allRedisChecks.get();
 
                 } catch (ExecutionException e) {
-                    // allOf completes after every check finishes,
-                    // including when one or more checks fail.
                     System.err.println(
-                        "Some Redis checks failed or timed out."
+                        "Some Redis observations failed or timed out."
                     );
                 }
 
                 long observationFinished = System.nanoTime();
+
+                pollingTask.cancel(false);
 
                 printSummary(
                     successfulInserts,
@@ -194,9 +233,9 @@ public class TestRunner {
                     metrics
                 );
 
-                // Keep your existing report writing here.
-                // Keep update/delete phases after insertion
-                // observations finish.
+                // Keep report writing here.
+                // Run update/delete phases only after the
+                // insertion observation phase has finished.
 
             } finally {
                 sqlExecutor.shutdownNow();
@@ -224,9 +263,17 @@ public class TestRunner {
             );
 
         } finally {
-            // Also handles failures while creating the SQL pool.
             sqlExecutor.shutdownNow();
             scheduler.shutdownNow();
+
+            // Complete remaining trackers if the run was interrupted.
+            pendingReads.forEach((id, pending) ->
+                pending.result.completeExceptionally(
+                    new CancellationException("Test run stopped")
+                )
+            );
+
+            pendingReads.clear();
         }
     }
 
@@ -243,7 +290,6 @@ public class TestRunner {
         for (Row row : rows) {
             futures.add(sqlExecutor.submit(() -> {
 
-                // Preserve your existing SQL insert implementation.
                 Long id = sqlClient.insert(
                     pool,
                     row.data(),
@@ -253,21 +299,17 @@ public class TestRunner {
                     row.updateTimestampUnix()
                 );
 
-                // Must be captured after successful SQL commit.
-                long sqlCommittedNanos = System.nanoTime();
+                // Assumes insert() returns after successful commit.
+                long committedNanos = System.nanoTime();
 
-                // First Redis command is submitted immediately.
-                // This does not wait for the key to appear.
-                CompletableFuture<Void> observation =
+                redisChecks.add(
                     waitForKeyInRedis(
                         id,
-                        sqlCommittedNanos,
+                        committedNanos,
                         metrics
-                    );
+                    )
+                );
 
-                redisChecks.add(observation);
-
-                // SQL worker is free to insert the next row.
                 return id;
             }));
         }
@@ -275,160 +317,226 @@ public class TestRunner {
         return futures;
     }
 
+    /**
+     * Registers a committed SQL record for the shared JSON.MGET reader.
+     * No Redis request is made here and no thread waits for the key.
+     */
     public CompletableFuture<Void> waitForKeyInRedis(
         Long id,
-        long sqlCommittedNanos,
+        long committedNanos,
         ConcurrentLinkedQueue<Metric> metrics
     ) {
-        String key = buildRedisKey(id);
-
-        long timeoutNanos =
-            TimeUnit.MILLISECONDS.toNanos(redisTimeout);
-
-        long intervalNanos =
-            TimeUnit.MILLISECONDS.toNanos(pollInterval);
-
-        CompletableFuture<Metric> observation =
-            new CompletableFuture<>();
-
-        class Probe implements Runnable {
-
-            private long firstCheckNanos;
-            private long checks;
-
-            private boolean expired(long now) {
-                return now - sqlCommittedNanos >= timeoutNanos;
-            }
-
-            private void timeout() {
-                observation.completeExceptionally(
-                    new TimeoutException(
-                        "Redis key not observed within "
-                            + redisTimeout + " ms: " + key
-                    )
-                );
-            }
-
-            @Override
-            public void run() {
-
-                if (observation.isDone()) {
-                    return;
-                }
-
-                long started = System.nanoTime();
-
-                if (expired(started)) {
-                    timeout();
-                    return;
-                }
-
-                if (firstCheckNanos == 0) {
-                    firstCheckNanos = started;
-                }
-
-                checks++;
-
-                try {
-                    redisClient.existsAsync(key)
-                        .whenComplete((exists, error) -> {
-
-                            // Capture before any logging or processing.
-                            long observedNanos = System.nanoTime();
-
-                            if (observation.isDone()) {
-                                return;
-                            }
-
-                            if (error != null) {
-                                observation.completeExceptionally(
-                                    error
-                                );
-                                return;
-                            }
-
-                            if (expired(observedNanos)) {
-                                timeout();
-                                return;
-                            }
-
-                            if (Boolean.TRUE.equals(exists)) {
-                                observation.complete(
-                                    new Metric(
-                                        id,
-                                        (observedNanos
-                                            - sqlCommittedNanos)
-                                            / 1_000_000.0,
-                                        (firstCheckNanos
-                                            - sqlCommittedNanos)
-                                            / 1_000_000.0,
-                                        checks,
-                                        "INSERT"
-                                    )
-                                );
-
-                            } else {
-                                scheduleNext();
-                            }
-                        });
-
-                } catch (RuntimeException e) {
-                    observation.completeExceptionally(e);
-                }
-            }
-
-            private void scheduleNext() {
-                if (observation.isDone()) {
-                    return;
-                }
-
-                try {
-                    scheduler.schedule(
-                        this,
-                        intervalNanos,
-                        TimeUnit.NANOSECONDS
-                    );
-
-                } catch (RejectedExecutionException e) {
-                    observation.completeExceptionally(e);
-                }
-            }
-        }
-
-        Probe probe = new Probe();
-
-        long remainingNanos = Math.max(
-            0L,
-            timeoutNanos
-                - (System.nanoTime() - sqlCommittedNanos)
+        PendingRead pending = new PendingRead(
+            id,
+            buildRedisKey(id),
+            committedNanos
         );
 
-        try {
-            ScheduledFuture<?> timeoutTask =
-                scheduler.schedule(
-                    probe::timeout,
-                    remainingNanos,
-                    TimeUnit.NANOSECONDS
-                );
-
-            observation.whenComplete((metric, error) ->
-                timeoutTask.cancel(false)
+        if (pendingReads.putIfAbsent(id, pending) != null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException(
+                    "Duplicate pending record ID: " + id
+                )
             );
-
-            // Directly submit the first asynchronous EXISTS command.
-            probe.run();
-
-        } catch (RuntimeException e) {
-            observation.completeExceptionally(e);
         }
 
-        // Metrics are added only if observation succeeds.
-        // The returned future completes after metrics.add().
-        return observation.thenAccept(metrics::add);
+        // Completes after the successful metric has been collected.
+        return pending.result.thenAccept(metrics::add);
+    }
+
+    /**
+     * Takes a snapshot of pending keys and submits JSON.MGET requests
+     * in groups. Missing keys remain pending for the next round.
+     */
+    private void pollRedisBatches() {
+
+        if (!redisRoundRunning.compareAndSet(false, true)) {
+            return;
+        }
+
+        List<CompletableFuture<Void>> requests =
+            new ArrayList<>();
+
+        try {
+            List<PendingRead> snapshot =
+                new ArrayList<>(pendingReads.values());
+
+            for (int offset = 0;
+                 offset < snapshot.size();
+                 offset += REDIS_READ_BATCH_SIZE) {
+
+                int end = Math.min(
+                    offset + REDIS_READ_BATCH_SIZE,
+                    snapshot.size()
+                );
+
+                List<PendingRead> batch =
+                    new ArrayList<>(end - offset);
+
+                long now = System.nanoTime();
+
+                for (int i = offset; i < end; i++) {
+                    PendingRead pending = snapshot.get(i);
+
+                    if (pending.result.isDone()) {
+                        pendingReads.remove(pending.id, pending);
+                        continue;
+                    }
+
+                    if (expired(pending, now)) {
+                        timeoutPending(pending);
+                        continue;
+                    }
+
+                    batch.add(pending);
+                }
+
+                if (!batch.isEmpty()) {
+                    requests.add(readJsonBatch(batch));
+                }
+            }
+
+        } catch (RuntimeException e) {
+            // Do not leave observation futures hanging if the
+            // polling round itself fails.
+            pendingReads.forEach((id, pending) ->
+                failPending(pending, e)
+            );
+
+        } finally {
+            // Start a new round only after this round's requests
+            // have all completed.
+            CompletableFuture.allOf(
+                requests.toArray(new CompletableFuture<?>[0])
+            ).whenComplete((ignored, error) ->
+                redisRoundRunning.set(false)
+            );
+        }
+    }
+
+    private CompletableFuture<Void> readJsonBatch(
+        List<PendingRead> batch
+    ) {
+        String[] keys = batch.stream()
+            .map(pending -> pending.key)
+            .toArray(String[]::new);
+
+        long submittedNanos = System.nanoTime();
+
+        for (PendingRead pending : batch) {
+            if (pending.firstCheckNanos == 0) {
+                pending.firstCheckNanos = submittedNanos;
+            }
+
+            pending.checks++;
+        }
+
+        try {
+            return redisClient.jsonMgetAsync(keys)
+                .<Void>handle((values, error) -> {
+
+                    // Same response timestamp for this batch.
+                    // Capture before examining or logging results.
+                    long observedNanos = System.nanoTime();
+
+                    if (error != null) {
+                        batch.forEach(pending ->
+                            failPending(pending, error)
+                        );
+                        return null;
+                    }
+
+                    if (values == null
+                            || values.size() != batch.size()) {
+                        IllegalStateException failure =
+                            new IllegalStateException(
+                                "Unexpected JSON.MGET response size"
+                            );
+
+                        batch.forEach(pending ->
+                            failPending(pending, failure)
+                        );
+
+                        return null;
+                    }
+
+                    for (int i = 0; i < batch.size(); i++) {
+                        PendingRead pending = batch.get(i);
+
+                        if (pending.result.isDone()) {
+                            continue;
+                        }
+
+                        if (expired(pending, observedNanos)) {
+                            timeoutPending(pending);
+                            continue;
+                        }
+
+                        // jsonMgetAsync() returns serialized JSON,
+                        // or Java null for a missing key.
+                        String json = values.get(i);
+
+                        if (json != null) {
+                            pendingReads.remove(
+                                pending.id,
+                                pending
+                            );
+
+                            pending.result.complete(
+                                new Metric(
+                                    pending.id,
+                                    (observedNanos
+                                        - pending.committedNanos)
+                                        / 1_000_000.0,
+                                    (pending.firstCheckNanos
+                                        - pending.committedNanos)
+                                        / 1_000_000.0,
+                                    pending.checks,
+                                    "INSERT"
+                                )
+                            );
+                        }
+
+                        // Missing keys stay in pendingReads.
+                    }
+
+                    return null;
+                });
+
+        } catch (RuntimeException e) {
+            batch.forEach(pending -> failPending(pending, e));
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private boolean expired(
+        PendingRead pending,
+        long nowNanos
+    ) {
+        return nowNanos - pending.committedNanos
+            >= TimeUnit.MILLISECONDS.toNanos(redisTimeout);
+    }
+
+    private void timeoutPending(PendingRead pending) {
+        failPending(
+            pending,
+            new TimeoutException(
+                "Redis key not observed within "
+                    + redisTimeout + " ms: " + pending.key
+            )
+        );
+    }
+
+    private void failPending(
+        PendingRead pending,
+        Throwable error
+    ) {
+        pendingReads.remove(pending.id, pending);
+        pending.result.completeExceptionally(error);
     }
 
     private String buildRedisKey(Long id) {
-        // Keep your existing implementation if its format differs.
+        // Keep your original implementation if its format differs.
         return keyPrefix + id;
     }
 
@@ -467,8 +575,6 @@ public class TestRunner {
         SQLException primaryFailure = null;
 
         try {
-            // Hold each borrowed connection so the next borrow
-            // warms a different physical connection.
             for (int i = 0; i < connectionCount; i++) {
                 Connection connection =
                     dataSource.getConnection();
@@ -561,7 +667,7 @@ public class TestRunner {
 
         System.out.printf("""
             
-            === INSERT / REDIS SUMMARY ===
+            === INSERT / REDIS JSON SUMMARY ===
             Requested inserts:             %,d
             Successful insert tasks:       %,d
             Failed insert tasks:           %,d
@@ -587,7 +693,6 @@ public class TestRunner {
             totalSeconds
         );
 
-        // Print a small sample after observation has finished.
         metrics.stream()
             .limit(10)
             .forEach(metric -> System.out.printf(
