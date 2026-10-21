@@ -1,38 +1,148 @@
-public CompletableFuture<List<String>> jsonMgetAsync(
-    String... keys
-) {
-    if (keys == null || keys.length == 0) {
-        return CompletableFuture.failedFuture(
-            new IllegalArgumentException(
-                "JSON.MGET requires at least one key"
-            )
+The simplest approach is to **format the summary once, print it, then append the same text to a file**. For repeated runs, create a **new `TestRunner` each time**, because each runner shuts down its scheduler.
+
+### 1. Add these imports to `TestRunner`
+
+```java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+```
+
+### 2. Adjust `printSummary()`
+
+Find your existing:
+
+```java
+System.out.printf("""
+    ...
+    """,
+    // existing arguments
+);
+```
+
+Change only its opening to:
+
+```java
+String summary = String.format("""
+    ...
+    """,
+    // Keep your existing summary text and arguments exactly as they are.
+);
+```
+
+Immediately afterward, add:
+
+```java
+System.out.print(summary);
+
+appendSummaryToFile(
+    "Run ID: " + runId
+        + System.lineSeparator()
+        + "Recorded at: " + Instant.now()
+        + System.lineSeparator()
+        + summary
+        + System.lineSeparator()
+);
+```
+
+Keep any per-record sample printing below this. Only the summary will be saved.
+
+### 3. Add this helper to `TestRunner`
+
+```java
+private void appendSummaryToFile(String summary) {
+    Path file = Path.of("results", "performance-summary.txt");
+
+    try {
+        Files.createDirectories(file.getParent());
+
+        Files.writeString(
+            file,
+            summary,
+            StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.APPEND
+        );
+
+    } catch (IOException e) {
+        throw new UncheckedIOException(
+            "Could not append summary to " + file.toAbsolutePath(),
+            e
+        );
+    }
+}
+```
+
+Each run appends to:
+
+```text
+results/performance-summary.txt
+```
+
+The path is relative to your program’s working directory. Writing happens after your timing measurements, so file output does not enter those measurements.
+
+### 4. Add a repeat function to your main class
+
+Add this import:
+
+```java
+import java.util.UUID;
+```
+
+Then add:
+
+```java
+private static void runRepeatedly(
+    Config config,
+    SqlServerClientManager sqlClient,
+    RedisClientManager redisClient,
+    int numberOfRuns
+) throws InterruptedException {
+
+    if (numberOfRuns <= 0) {
+        throw new IllegalArgumentException(
+            "numberOfRuns must be positive"
         );
     }
 
-    CommandArgs<String, String> args =
-        new CommandArgs<>(StringCodec.UTF8);
+    for (int i = 1; i <= numberOfRuns; i++) {
+        System.out.printf(
+            "%n=== RUN %d OF %d ===%n",
+            i,
+            numberOfRuns
+        );
 
-    // Each key must be a separate Redis argument.
-    for (String key : keys) {
-        if (key == null || key.isBlank()) {
-            return CompletableFuture.failedFuture(
-                new IllegalArgumentException(
-                    "JSON.MGET received an empty key"
-                )
-            );
-        }
+        String runId = UUID.randomUUID().toString();
 
-        args.addKey(key);
+        TestRunner runner = new TestRunner(
+            config,
+            runId,
+            sqlClient,
+            redisClient
+        );
+
+        runner.run();
     }
-
-    // Required: path comes AFTER all keys.
-    args.add("$");
-
-    return connection.async()
-        .dispatch(
-            JsonCommand.MGET,
-            new ValueListOutput<String, String>(StringCodec.UTF8),
-            args
-        )
-        .toCompletableFuture();
 }
+```
+
+### 5. Replace the single-run call in `main()`
+
+After your existing configuration and client creation, replace:
+
+```java
+runner.run();
+```
+
+with:
+
+```java
+runRepeatedly(config, sqlClient, redisClient, 5);
+```
+
+This runs **five times sequentially** and appends five summaries. Keep your existing Redis client closure **after `runRepeatedly()`**, so the connection remains available for all five runs.
+
+Each run inserts another `recordCount` rows unless your existing cleanup removes them.
