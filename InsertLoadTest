@@ -1,186 +1,488 @@
-import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
-import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
 
-public class InsertLoadTest {
+public class TestRunner {
 
-    private static final String INSERT_SQL = """
-        INSERT INTO dbo.INSERT_LOAD_TEST (id, data)
-        VALUES (?, ?)
-        """;
+    public static final String SINGLE = "single";
+    public static final String BATCH = "batch";
 
-    private static final int QUERY_TIMEOUT_SECONDS = 30;
+    private final String runId;
+    private final SqlServerClientManager sqlClient;
+    private final RedisClientManager redisClient;
 
-    public record TestRow(long id, String data) {}
+    private final String keyPrefix;
+    private final int recordCount;
+    private final int connectionCount;
 
-    public record InsertResult(
-        long id,
-        long startedNanos,
-        long commitAcknowledgedNanos,
-        long finishedNanos,
-        String sqlError,
-        String cleanupError
+    // Both configuration values are assumed to be milliseconds.
+    private final long pollInterval;
+    private final long redisTimeout;
+
+    private final ScheduledThreadPoolExecutor scheduler;
+
+    private record Row(
+        Long id,
+        String data,
+        Timestamp createTimestamp,
+        Long createTimestampUnix,
+        Timestamp updateTimestamp,
+        Long updateTimestampUnix
     ) {
-        public boolean successful() {
-            return commitAcknowledgedNanos != 0;
-        }
-
-        // Includes waiting to borrow a connection and SQL execution.
-        // Excludes waiting in the executor queue.
-        public double requestMillis() {
-            long end = successful()
-                ? commitAcknowledgedNanos
-                : finishedNanos;
-
-            return (end - startedNanos) / 1_000_000.0;
+        private Row(
+            Long id,
+            String data,
+            Timestamp updateTimestamp,
+            Long updateTimestampUnix
+        ) {
+            this(
+                id,
+                data,
+                null,
+                null,
+                updateTimestamp,
+                updateTimestampUnix
+            );
         }
     }
 
-    public record TestReport(
-        int requested,
-        int concurrency,
-        long elapsedNanos,
-        List<InsertResult> results
+    record Metric(
+        Long id,
+        double redisMillis,
+        double firstCheckDelayMillis,
+        long checks,
+        String operation
+    ) {}
+
+    public TestRunner(
+        Config config,
+        String runId,
+        SqlServerClientManager sqlClient,
+        RedisClientManager redisClient
     ) {
-        public long successful() {
-            return results.stream()
-                .filter(InsertResult::successful)
-                .count();
-        }
+        this.runId = runId;
+        this.sqlClient = sqlClient;
+        this.redisClient = redisClient;
 
-        public double elapsedSeconds() {
-            return elapsedNanos / 1_000_000_000.0;
-        }
+        this.keyPrefix = config.getRedisKeyPrefix();
+        this.recordCount = config.getRecordCount();
+        this.connectionCount = config.getConnectionPoolSize();
+        this.pollInterval = config.getPollInterval();
+        this.redisTimeout = config.getRedisTimeout();
 
-        public double insertsPerSecond() {
-            return successful() / elapsedSeconds();
-        }
-    }
-
-    public static void main(String[] args) throws Exception {
-
-        // Usage: InsertLoadTest [recordCount] [concurrency] [firstId]
-        int recordCount = args.length > 0
-            ? Integer.parseInt(args[0]) : 10_000;
-
-        int concurrency = args.length > 1
-            ? Integer.parseInt(args[1]) : 50;
-
-        // Supply an explicit unused range when running multiple generators.
-        long firstId = args.length > 2
-            ? Long.parseLong(args[2])
-            : Math.multiplyExact(System.currentTimeMillis(), 1_000_000L);
-
-        if (recordCount <= 0 || concurrency <= 0) {
+        if (recordCount <= 0 || connectionCount <= 0) {
             throw new IllegalArgumentException(
-                "recordCount and concurrency must be positive"
+                "recordCount and connectionPoolSize must be positive"
             );
         }
 
-        // Generate payloads before timing starts.
-        List<TestRow> rows = prepareRows(recordCount, firstId);
+        if (pollInterval <= 0 || redisTimeout <= 0) {
+            throw new IllegalArgumentException(
+                "pollInterval and redisTimeout must be positive milliseconds"
+            );
+        }
 
-        try (HikariDataSource pool = createPool(concurrency)) {
+        this.scheduler = new ScheduledThreadPoolExecutor(1);
 
-            System.out.println("Warming SQL connections...");
-            warmPool(pool, concurrency);
+        // Remove cancelled timeout tasks from the scheduler queue.
+        this.scheduler.setRemoveOnCancelPolicy(true);
+    }
 
-            System.out.printf(
-                "Starting %,d inserts with %d workers. First ID: %d%n",
-                recordCount, concurrency, firstId
+    public void run() throws InterruptedException {
+
+        List<Row> rows = prepareRows(runId, recordCount);
+
+        ConcurrentLinkedQueue<Metric> metrics =
+            new ConcurrentLinkedQueue<>();
+
+        ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks =
+            new ConcurrentLinkedQueue<>();
+
+        ThreadPoolExecutor sqlExecutor =
+            (ThreadPoolExecutor)
+                Executors.newFixedThreadPool(connectionCount);
+
+        try (HikariDataSource pool = sqlClient.createPool()) {
+
+            try {
+                System.out.println("Warming SQL connections...");
+                warmPool(pool);
+
+                // Warm the existing Redis connection before timing.
+                // The key does not need to exist.
+                redisClient.exists(keyPrefix + "__warmup__");
+
+                sqlExecutor.prestartAllCoreThreads();
+                scheduler.prestartAllCoreThreads();
+
+                System.out.printf(
+                    "Starting %,d inserts with %d SQL workers%n",
+                    recordCount,
+                    connectionCount
+                );
+
+                long workloadStarted = System.nanoTime();
+
+                List<Future<Long>> inserts = runSingleInserts(
+                    rows,
+                    sqlExecutor,
+                    pool,
+                    metrics,
+                    redisChecks
+                );
+
+                int successfulInserts = 0;
+                int failedInserts = 0;
+
+                // Redis checks are already running during this wait.
+                for (Future<Long> insert : inserts) {
+                    try {
+                        insert.get();
+                        successfulInserts++;
+
+                    } catch (ExecutionException e) {
+                        failedInserts++;
+
+                        // Print only the first few SQL failures.
+                        if (failedInserts <= 5) {
+                            System.err.println(
+                                "Insert task failed: " + e.getCause()
+                            );
+                        }
+                    }
+                }
+
+                long sqlFinished = System.nanoTime();
+
+                // All SQL tasks have finished registering their
+                // Redis observation futures.
+                CompletableFuture<Void> allRedisChecks =
+                    CompletableFuture.allOf(
+                        redisChecks.toArray(
+                            new CompletableFuture<?>[0]
+                        )
+                    );
+
+                try {
+                    allRedisChecks.get();
+
+                } catch (ExecutionException e) {
+                    // allOf completes after every check finishes,
+                    // including when one or more checks fail.
+                    System.err.println(
+                        "Some Redis checks failed or timed out."
+                    );
+                }
+
+                long observationFinished = System.nanoTime();
+
+                printSummary(
+                    successfulInserts,
+                    failedInserts,
+                    workloadStarted,
+                    sqlFinished,
+                    observationFinished,
+                    redisChecks,
+                    metrics
+                );
+
+                // Keep your existing report writing here.
+                // Keep update/delete phases after insertion
+                // observations finish.
+
+            } finally {
+                sqlExecutor.shutdownNow();
+                scheduler.shutdownNow();
+
+                if (!sqlExecutor.awaitTermination(
+                        60, TimeUnit.SECONDS)) {
+                    System.err.println(
+                        "SQL executor is still terminating."
+                    );
+                }
+
+                if (!scheduler.awaitTermination(
+                        5, TimeUnit.SECONDS)) {
+                    System.err.println(
+                        "Redis scheduler is still terminating."
+                    );
+                }
+            }
+
+        } catch (SQLException e) {
+            throw new RuntimeException(
+                "SQL setup or connection warm-up failed",
+                e
             );
 
-            TestReport report = runTest(pool, rows, concurrency);
-
-            printReport(report);
-
-            // report.results() retains per-record timestamps.
-            // A future Redis observer can correlate records by ID.
+        } finally {
+            // Also handles failures while creating the SQL pool.
+            sqlExecutor.shutdownNow();
+            scheduler.shutdownNow();
         }
     }
 
-    public static HikariDataSource createPool(int poolSize) {
-
-        SQLServerDataSource sql = new SQLServerDataSource();
-
-        // Use your existing working JDBC connection properties.
-        sql.setURL(requiredEnv("SQL_JDBC_URL"));
-
-        // Optional: credentials can instead be supplied through your
-        // existing authentication configuration.
-        String user = System.getenv("SQL_USER");
-        String password = System.getenv("SQL_PASSWORD");
-
-        if (user != null && !user.isBlank()) {
-            sql.setUser(user);
-        }
-
-        if (password != null) {
-            sql.setPassword(password);
-        }
-
-        sql.setLoginTimeout(30);
-
-        // Milliseconds. Bounds stalled network reads.
-        sql.setSocketTimeout(60_000);
-
-        HikariConfig config = new HikariConfig();
-        config.setPoolName("InsertLoadPool");
-        config.setDataSource(sql);
-
-        config.setMaximumPoolSize(poolSize);
-        config.setMinimumIdle(poolSize);
-
-        config.setAutoCommit(true);
-        config.setConnectionTimeout(30_000);
-        config.setValidationTimeout(5_000);
-
-        return new HikariDataSource(config);
-    }
-
-    public static List<TestRow> prepareRows(
-        int count,
-        long firstId
+    private List<Future<Long>> runSingleInserts(
+        List<Row> rows,
+        ThreadPoolExecutor sqlExecutor,
+        HikariDataSource pool,
+        ConcurrentLinkedQueue<Metric> metrics,
+        ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
     ) {
-        List<TestRow> rows = new ArrayList<>(count);
+        List<Future<Long>> futures =
+            new ArrayList<>(rows.size());
+
+        for (Row row : rows) {
+            futures.add(sqlExecutor.submit(() -> {
+
+                // Preserve your existing SQL insert implementation.
+                Long id = sqlClient.insert(
+                    pool,
+                    row.data(),
+                    row.createTimestamp(),
+                    row.createTimestampUnix(),
+                    row.updateTimestamp(),
+                    row.updateTimestampUnix()
+                );
+
+                // Must be captured after successful SQL commit.
+                long sqlCommittedNanos = System.nanoTime();
+
+                // First Redis command is submitted immediately.
+                // This does not wait for the key to appear.
+                CompletableFuture<Void> observation =
+                    waitForKeyInRedis(
+                        id,
+                        sqlCommittedNanos,
+                        metrics
+                    );
+
+                redisChecks.add(observation);
+
+                // SQL worker is free to insert the next row.
+                return id;
+            }));
+        }
+
+        return futures;
+    }
+
+    public CompletableFuture<Void> waitForKeyInRedis(
+        Long id,
+        long sqlCommittedNanos,
+        ConcurrentLinkedQueue<Metric> metrics
+    ) {
+        String key = buildRedisKey(id);
+
+        long timeoutNanos =
+            TimeUnit.MILLISECONDS.toNanos(redisTimeout);
+
+        long intervalNanos =
+            TimeUnit.MILLISECONDS.toNanos(pollInterval);
+
+        CompletableFuture<Metric> observation =
+            new CompletableFuture<>();
+
+        class Probe implements Runnable {
+
+            private long firstCheckNanos;
+            private long checks;
+
+            private boolean expired(long now) {
+                return now - sqlCommittedNanos >= timeoutNanos;
+            }
+
+            private void timeout() {
+                observation.completeExceptionally(
+                    new TimeoutException(
+                        "Redis key not observed within "
+                            + redisTimeout + " ms: " + key
+                    )
+                );
+            }
+
+            @Override
+            public void run() {
+
+                if (observation.isDone()) {
+                    return;
+                }
+
+                long started = System.nanoTime();
+
+                if (expired(started)) {
+                    timeout();
+                    return;
+                }
+
+                if (firstCheckNanos == 0) {
+                    firstCheckNanos = started;
+                }
+
+                checks++;
+
+                try {
+                    redisClient.existsAsync(key)
+                        .whenComplete((exists, error) -> {
+
+                            // Capture before any logging or processing.
+                            long observedNanos = System.nanoTime();
+
+                            if (observation.isDone()) {
+                                return;
+                            }
+
+                            if (error != null) {
+                                observation.completeExceptionally(
+                                    error
+                                );
+                                return;
+                            }
+
+                            if (expired(observedNanos)) {
+                                timeout();
+                                return;
+                            }
+
+                            if (Boolean.TRUE.equals(exists)) {
+                                observation.complete(
+                                    new Metric(
+                                        id,
+                                        (observedNanos
+                                            - sqlCommittedNanos)
+                                            / 1_000_000.0,
+                                        (firstCheckNanos
+                                            - sqlCommittedNanos)
+                                            / 1_000_000.0,
+                                        checks,
+                                        "INSERT"
+                                    )
+                                );
+
+                            } else {
+                                scheduleNext();
+                            }
+                        });
+
+                } catch (RuntimeException e) {
+                    observation.completeExceptionally(e);
+                }
+            }
+
+            private void scheduleNext() {
+                if (observation.isDone()) {
+                    return;
+                }
+
+                try {
+                    scheduler.schedule(
+                        this,
+                        intervalNanos,
+                        TimeUnit.NANOSECONDS
+                    );
+
+                } catch (RejectedExecutionException e) {
+                    observation.completeExceptionally(e);
+                }
+            }
+        }
+
+        Probe probe = new Probe();
+
+        long remainingNanos = Math.max(
+            0L,
+            timeoutNanos
+                - (System.nanoTime() - sqlCommittedNanos)
+        );
+
+        try {
+            ScheduledFuture<?> timeoutTask =
+                scheduler.schedule(
+                    probe::timeout,
+                    remainingNanos,
+                    TimeUnit.NANOSECONDS
+                );
+
+            observation.whenComplete((metric, error) ->
+                timeoutTask.cancel(false)
+            );
+
+            // Directly submit the first asynchronous EXISTS command.
+            probe.run();
+
+        } catch (RuntimeException e) {
+            observation.completeExceptionally(e);
+        }
+
+        // Metrics are added only if observation succeeds.
+        // The returned future completes after metrics.add().
+        return observation.thenAccept(metrics::add);
+    }
+
+    private String buildRedisKey(Long id) {
+        // Keep your existing implementation if its format differs.
+        return keyPrefix + id;
+    }
+
+    private static List<Row> prepareRows(
+        String runId,
+        int count
+    ) {
+        List<Row> rows = new ArrayList<>(count);
 
         for (int i = 0; i < count; i++) {
-            long id = Math.addExact(firstId, i);
-            rows.add(new TestRow(id, "test-record-" + id));
+            Instant now = Instant.now();
+
+            Timestamp timestamp = Timestamp.from(now);
+            long unixTimestamp = now.getEpochSecond();
+
+            rows.add(new Row(
+                null,
+                "insert-" + i + "-" + runId,
+                timestamp,
+                unixTimestamp,
+                timestamp,
+                unixTimestamp
+            ));
         }
 
         return List.copyOf(rows);
     }
 
-    public static void warmPool(
-        DataSource dataSource,
-        int connectionCount
+    private void warmPool(
+        DataSource dataSource
     ) throws SQLException {
 
         List<Connection> connections =
             new ArrayList<>(connectionCount);
 
+        SQLException primaryFailure = null;
+
         try {
-            // Hold the connections so each borrow warms a separate
-            // physical connection rather than reusing the same one.
+            // Hold each borrowed connection so the next borrow
+            // warms a different physical connection.
             for (int i = 0; i < connectionCount; i++) {
-                Connection connection = dataSource.getConnection();
+                Connection connection =
+                    dataSource.getConnection();
+
                 connections.add(connection);
 
                 try (PreparedStatement statement =
                          connection.prepareStatement("SELECT 1")) {
-                    statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
 
-                    try (var resultSet = statement.executeQuery()) {
+                    statement.setQueryTimeout(30);
+
+                    try (var resultSet =
+                             statement.executeQuery()) {
+
                         if (!resultSet.next()
                                 || resultSet.getInt(1) != 1) {
                             throw new SQLException(
@@ -191,253 +493,125 @@ public class InsertLoadTest {
                 }
             }
 
+        } catch (SQLException e) {
+            primaryFailure = e;
+            throw e;
+
         } finally {
-            SQLException failure = null;
+            SQLException cleanupFailure = null;
 
             for (Connection connection : connections) {
                 try {
                     connection.close();
+
                 } catch (SQLException e) {
-                    if (failure == null) {
-                        failure = e;
+                    if (cleanupFailure == null) {
+                        cleanupFailure = e;
                     } else {
-                        failure.addSuppressed(e);
+                        cleanupFailure.addSuppressed(e);
                     }
                 }
             }
 
-            if (failure != null) {
-                throw failure;
-            }
-        }
-    }
-
-    public static TestReport runTest(
-        DataSource dataSource,
-        List<TestRow> rows,
-        int concurrency
-    ) throws InterruptedException, ExecutionException {
-
-        if (rows.isEmpty() || concurrency <= 0) {
-            throw new IllegalArgumentException(
-                "Rows must not be empty; concurrency must be positive"
-            );
-        }
-
-        ThreadPoolExecutor executor =
-            (ThreadPoolExecutor)
-                Executors.newFixedThreadPool(concurrency);
-
-        CountDownLatch startGate = new CountDownLatch(1);
-
-        List<Future<InsertResult>> futures =
-            new ArrayList<>(rows.size());
-
-        try {
-            executor.prestartAllCoreThreads();
-
-            // Prepare the complete workload before releasing workers.
-            for (TestRow row : rows) {
-                futures.add(executor.submit(() -> {
-                    startGate.await();
-                    return insertOne(dataSource, row);
-                }));
-            }
-
-            long start = System.nanoTime();
-            startGate.countDown();
-
-            List<InsertResult> results =
-                new ArrayList<>(rows.size());
-
-            long lastFinished = start;
-
-            for (Future<InsertResult> future : futures) {
-                InsertResult result = future.get();
-
-                results.add(result);
-                lastFinished = Math.max(
-                    lastFinished,
-                    result.finishedNanos()
-                );
-            }
-
-            return new TestReport(
-                rows.size(),
-                concurrency,
-                lastFinished - start,
-                List.copyOf(results)
-            );
-
-        } finally {
-            for (Future<InsertResult> future : futures) {
-                if (!future.isDone()) {
-                    future.cancel(true);
+            if (cleanupFailure != null) {
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
                 }
             }
-
-            executor.shutdownNow();
-
-            // JDBC cancellation is best effort; configured database
-            // and socket timeouts also limit stalled calls.
-            if (!executor.awaitTermination(65, TimeUnit.SECONDS)) {
-                System.err.println(
-                    "Some JDBC tasks are still terminating."
-                );
-            }
         }
     }
 
-    public static InsertResult insertOne(
-        DataSource dataSource,
-        TestRow row
+    private void printSummary(
+        int successfulInserts,
+        int failedInserts,
+        long workloadStarted,
+        long sqlFinished,
+        long observationFinished,
+        ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks,
+        ConcurrentLinkedQueue<Metric> metrics
     ) {
-        long started = System.nanoTime();
-        long committed = 0;
+        double sqlSeconds =
+            (sqlFinished - workloadStarted)
+                / 1_000_000_000.0;
 
-        String sqlError = null;
-        String cleanupError = null;
+        double totalSeconds =
+            (observationFinished - workloadStarted)
+                / 1_000_000_000.0;
 
-        try (Connection connection = dataSource.getConnection()) {
+        long failedChecks = redisChecks.stream()
+            .filter(CompletableFuture::isCompletedExceptionally)
+            .count();
 
-            // The pool is configured with autoCommit=true.
-            try (PreparedStatement statement =
-                     connection.prepareStatement(INSERT_SQL)) {
-
-                statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
-                statement.setLong(1, row.id());
-                statement.setString(2, row.data());
-
-                statement.executeUpdate();
-
-                // With autoCommit=true, successful execution
-                // acknowledges this individual insert's commit.
-                committed = System.nanoTime();
-            }
-
-        } catch (SQLException e) {
-            String detail = "SQLState=" + e.getSQLState()
-                + ", code=" + e.getErrorCode()
-                + ", message=" + e.getMessage();
-
-            if (committed == 0) {
-                sqlError = detail;
-            } else {
-                // The insert succeeded, but resource cleanup failed.
-                cleanupError = detail;
-            }
-        }
-
-        return new InsertResult(
-            row.id(),
-            started,
-            committed,
-            System.nanoTime(),
-            sqlError,
-            cleanupError
-        );
-    }
-
-    public static void printReport(TestReport report) {
-
-        long successful = report.successful();
-
-        double[] durations = report.results().stream()
-            .filter(InsertResult::successful)
-            .mapToDouble(InsertResult::requestMillis)
-            .sorted()
-            .toArray();
-
-        double average = Arrays.stream(durations)
+        double averageRedisMillis = metrics.stream()
+            .mapToDouble(Metric::redisMillis)
             .average()
+            .orElse(Double.NaN);
+
+        double averageFirstCheckDelay = metrics.stream()
+            .mapToDouble(Metric::firstCheckDelayMillis)
+            .average()
+            .orElse(Double.NaN);
+
+        double maxFirstCheckDelay = metrics.stream()
+            .mapToDouble(Metric::firstCheckDelayMillis)
+            .max()
             .orElse(Double.NaN);
 
         System.out.printf("""
             
-            Requested:           %,d
-            Concurrent workers:  %,d
-            Successful:          %,d
-            Failed/unconfirmed:  %,d
-            Total time:          %.3f seconds
-            Throughput:          %.1f successful inserts/second
-            Average request:     %.3f ms
-            P95 request:         %.3f ms
-            P99 request:         %.3f ms
+            === INSERT / REDIS SUMMARY ===
+            Requested inserts:             %,d
+            Successful insert tasks:       %,d
+            Failed insert tasks:           %,d
+            SQL workload duration:         %.3f seconds
+            SQL throughput under polling:  %.1f inserts/second
+            Redis observations completed:  %,d
+            Redis checks failed/timed out: %,d
+            Average observed Redis delay:  %.3f ms
+            Average first check delay:     %.3f ms
+            Maximum first check delay:     %.3f ms
+            Total observation duration:    %.3f seconds
             %n""",
-            report.requested(),
-            report.concurrency(),
-            successful,
-            report.requested() - successful,
-            report.elapsedSeconds(),
-            report.insertsPerSecond(),
-            average,
-            percentile(durations, 0.95),
-            percentile(durations, 0.99)
+            recordCount,
+            successfulInserts,
+            failedInserts,
+            sqlSeconds,
+            successfulInserts / sqlSeconds,
+            metrics.size(),
+            failedChecks,
+            averageRedisMillis,
+            averageFirstCheckDelay,
+            maxFirstCheckDelay,
+            totalSeconds
         );
 
-        report.results().stream()
-            .filter(r -> r.sqlError() != null
-                      || r.cleanupError() != null)
-            .limit(5)
-            .forEach(r -> System.out.printf(
-                "ID=%d, SQL error=%s, cleanup error=%s%n",
-                r.id(), r.sqlError(), r.cleanupError()
+        // Print a small sample after observation has finished.
+        metrics.stream()
+            .limit(10)
+            .forEach(metric -> System.out.printf(
+                "ID=%d, Redis=%.3f ms, first check=%.3f ms, checks=%d%n",
+                metric.id(),
+                metric.redisMillis(),
+                metric.firstCheckDelayMillis(),
+                metric.checks()
             ));
+
+        redisChecks.stream()
+            .filter(CompletableFuture::isCompletedExceptionally)
+            .limit(5)
+            .forEach(check -> {
+                try {
+                    check.join();
+
+                } catch (CompletionException e) {
+                    System.err.println(
+                        "Redis observation failed: " + e.getCause()
+                    );
+                }
+            });
     }
 
-    private static double percentile(
-        double[] sortedValues,
-        double percentile
-    ) {
-        if (sortedValues.length == 0) {
-            return Double.NaN;
-        }
-
-        int index = (int) Math.ceil(
-            percentile * sortedValues.length
-        ) - 1;
-
-        return sortedValues[index];
-    }
-
-    private static String requiredEnv(String name) {
-        String value = System.getenv(name);
-
-        if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(
-                "Missing environment variable: " + name
-            );
-        }
-
-        return value;
-    }
+    // Keep your existing update/delete and cleanup methods here.
 }
-
-
-
-//Pom.xml
-<properties>
-    <maven.compiler.release>17</maven.compiler.release>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-</properties>
-
-<dependencies>
-    <dependency>
-        <groupId>com.microsoft.sqlserver</groupId>
-        <artifactId>mssql-jdbc</artifactId>
-        <version>12.8.1.jre11</version>
-    </dependency>
-
-    <dependency>
-        <groupId>com.zaxxer</groupId>
-        <artifactId>HikariCP</artifactId>
-        <version>5.1.0</version>
-    </dependency>
-
-    <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-simple</artifactId>
-        <version>2.0.13</version>
-        <scope>runtime</scope>
-    </dependency>
-</dependencies>
