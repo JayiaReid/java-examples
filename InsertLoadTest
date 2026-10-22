@@ -424,3 +424,345 @@ Use a **fresh `redisChecks` collection for each phase**, or clear it only after 
 **For accurate delete results, only delete records whose presence was already confirmed.** A key that never appeared would otherwise immediately pass the “missing” check. Likewise, check SQL affected-row counts: an update/delete affecting zero rows should be reported as a failed SQL operation.
 
 Your summary should calculate averages separately by `Metric.operation()`, rather than combining insert, update, and delete timings.
+
+private List<Future<?>> runSingleUpdates(
+    List<Row> rows,
+    ThreadPoolExecutor executor,
+    HikariDataSource pool,
+    ConcurrentLinkedQueue<Metric> metrics,
+    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
+) {
+    List<Future<?>> tasks = new ArrayList<>(rows.size());
+
+    for (Row row : rows) {
+        tasks.add(executor.submit(() -> {
+            try {
+                sqlClient.update(
+                    pool,
+                    row.id(),
+                    row.data(),
+                    row.updateTimestamp(),
+                    row.updateTimestampUnix()
+                );
+
+                long committedNanos = System.nanoTime();
+
+                redisChecks.add(
+                    waitForUpdateInRedis(
+                        row.id(),
+                        committedNanos,
+                        row.data(),
+                        metrics
+                    )
+                );
+
+            } catch (SQLException e) {
+                throw new RuntimeException(
+                    "SQL update failed for ID: " + row.id(),
+                    e
+                );
+            }
+        }));
+    }
+
+    return tasks;
+}
+
+private List<Future<?>> runSingleDeletes(
+    List<Long> ids,
+    ThreadPoolExecutor executor,
+    HikariDataSource pool,
+    ConcurrentLinkedQueue<Metric> metrics,
+    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
+) {
+    List<Future<?>> tasks = new ArrayList<>(ids.size());
+
+    for (Long id : ids) {
+        tasks.add(executor.submit(() -> {
+            try {
+                sqlClient.delete(id, pool);
+
+                long committedNanos = System.nanoTime();
+
+                redisChecks.add(
+                    waitForDeleteInRedis(
+                        id,
+                        committedNanos,
+                        metrics
+                    )
+                );
+
+            } catch (SQLException e) {
+                throw new RuntimeException(
+                    "SQL delete failed for ID: " + id,
+                    e
+                );
+            }
+        }));
+    }
+
+    return tasks;
+}
+public void run() throws InterruptedException {
+
+    List<Row> rows = prepareRows(runId, recordCount);
+
+    ThreadPoolExecutor sqlExecutor =
+        (ThreadPoolExecutor)
+            Executors.newFixedThreadPool(connectionCount);
+
+    try (HikariDataSource pool = sqlClient.createPool()) {
+
+        try {
+            System.out.println("Warming SQL connections...");
+            warmPool(pool);
+
+            // Warm the existing Redis connection.
+            redisClient.exists(keyPrefix + "__warmup__");
+
+            sqlExecutor.prestartAllCoreThreads();
+            scheduler.prestartAllCoreThreads();
+
+            ScheduledFuture<?> redisPollingTask =
+                scheduler.scheduleWithFixedDelay(
+                    this::pollRedisBatches,
+                    0,
+                    pollInterval,
+                    TimeUnit.MILLISECONDS
+                );
+
+            try {
+                // ================= INSERT =================
+
+                ConcurrentLinkedQueue<Metric> insertMetrics =
+                    new ConcurrentLinkedQueue<>();
+
+                ConcurrentLinkedQueue<CompletableFuture<Void>>
+                    insertChecks = new ConcurrentLinkedQueue<>();
+
+                System.out.printf(
+                    "%nStarting %,d inserts%n",
+                    rows.size()
+                );
+
+                long insertStarted = System.nanoTime();
+
+                List<Future<Long>> inserts = runSingleInserts(
+                    rows,
+                    sqlExecutor,
+                    pool,
+                    insertMetrics,
+                    insertChecks
+                );
+
+                awaitPhase(inserts, insertChecks);
+
+                long insertFinished = System.nanoTime();
+
+                // Only proceed if SQL tasks and Redis observations
+                // for the insertion phase succeeded.
+                List<Long> liveIds = new ArrayList<>(inserts.size());
+
+                for (Future<Long> insert : inserts) {
+                    liveIds.add(insert.get());
+                }
+
+                printOperationSummary(
+                    "INSERT",
+                    rows.size(),
+                    insertStarted,
+                    insertFinished,
+                    insertMetrics
+                );
+
+
+                // ================= UPDATE =================
+
+                // Prepare unique update values before starting timing.
+                List<Row> rowsForUpdate =
+                    new ArrayList<>(liveIds.size());
+
+                for (Long id : liveIds) {
+                    Instant now = Instant.now();
+
+                    rowsForUpdate.add(new Row(
+                        id,
+                        "update-" + id + "-" + runId,
+                        Timestamp.from(now),
+                        now.getEpochSecond()
+                    ));
+                }
+
+                ConcurrentLinkedQueue<Metric> updateMetrics =
+                    new ConcurrentLinkedQueue<>();
+
+                ConcurrentLinkedQueue<CompletableFuture<Void>>
+                    updateChecks = new ConcurrentLinkedQueue<>();
+
+                System.out.printf(
+                    "%nStarting %,d updates%n",
+                    rowsForUpdate.size()
+                );
+
+                long updateStarted = System.nanoTime();
+
+                List<Future<?>> updates = runSingleUpdates(
+                    rowsForUpdate,
+                    sqlExecutor,
+                    pool,
+                    updateMetrics,
+                    updateChecks
+                );
+
+                awaitPhase(updates, updateChecks);
+
+                long updateFinished = System.nanoTime();
+
+                printOperationSummary(
+                    "UPDATE",
+                    rowsForUpdate.size(),
+                    updateStarted,
+                    updateFinished,
+                    updateMetrics
+                );
+
+
+                // ================= DELETE =================
+
+                ConcurrentLinkedQueue<Metric> deleteMetrics =
+                    new ConcurrentLinkedQueue<>();
+
+                ConcurrentLinkedQueue<CompletableFuture<Void>>
+                    deleteChecks = new ConcurrentLinkedQueue<>();
+
+                System.out.printf(
+                    "%nStarting %,d deletes%n",
+                    liveIds.size()
+                );
+
+                long deleteStarted = System.nanoTime();
+
+                List<Future<?>> deletes = runSingleDeletes(
+                    liveIds,
+                    sqlExecutor,
+                    pool,
+                    deleteMetrics,
+                    deleteChecks
+                );
+
+                awaitPhase(deletes, deleteChecks);
+
+                long deleteFinished = System.nanoTime();
+
+                printOperationSummary(
+                    "DELETE",
+                    liveIds.size(),
+                    deleteStarted,
+                    deleteFinished,
+                    deleteMetrics
+                );
+
+            } finally {
+                // Stop the shared reader after all phases,
+                // or if a phase fails.
+                redisPollingTask.cancel(false);
+            }
+
+        } finally {
+            // Stop workers before the SQL pool is closed.
+            sqlExecutor.shutdownNow();
+            scheduler.shutdownNow();
+
+            if (!sqlExecutor.awaitTermination(
+                    60, TimeUnit.SECONDS)) {
+                System.err.println(
+                    "SQL executor is still terminating."
+                );
+            }
+
+            if (!scheduler.awaitTermination(
+                    5, TimeUnit.SECONDS)) {
+                System.err.println(
+                    "Redis scheduler is still terminating."
+                );
+            }
+        }
+
+    } catch (SQLException e) {
+        throw new RuntimeException(
+            "SQL setup or connection warm-up failed",
+            e
+        );
+
+    } catch (ExecutionException e) {
+        // Do not start the next phase if the current phase failed.
+        throw new RuntimeException(
+            "Test phase failed during run " + runId,
+            e.getCause()
+        );
+
+    } finally {
+        sqlExecutor.shutdownNow();
+        scheduler.shutdownNow();
+
+        pendingReads.forEach((id, pending) ->
+            pending.result.completeExceptionally(
+                new CancellationException("Test run stopped")
+            )
+        );
+
+        pendingReads.clear();
+    }
+}
+
+private void printOperationSummary(
+    String operation,
+    int requested,
+    long startedNanos,
+    long finishedNanos,
+    ConcurrentLinkedQueue<Metric> metrics
+) {
+    double durationSeconds =
+        (finishedNanos - startedNanos) / 1_000_000_000.0;
+
+    double averageRedisMillis = metrics.stream()
+        .mapToDouble(Metric::redisMillis)
+        .average()
+        .orElse(Double.NaN);
+
+    double averageFirstCheckMillis = metrics.stream()
+        .mapToDouble(Metric::firstCheckDelayMillis)
+        .average()
+        .orElse(Double.NaN);
+
+    double maximumRedisMillis = metrics.stream()
+        .mapToDouble(Metric::redisMillis)
+        .max()
+        .orElse(Double.NaN);
+
+    String summary = String.format("""
+        
+        === %s SUMMARY ===
+        Run ID:                     %s
+        Recorded at:                %s
+        Requested operations:       %,d
+        Redis observations:         %,d
+        Phase duration:             %.3f seconds
+        Average observed delay:     %.3f ms
+        Maximum observed delay:     %.3f ms
+        Average first check delay:  %.3f ms
+        %n""",
+        operation,
+        runId,
+        Instant.now(),
+        requested,
+        metrics.size(),
+        durationSeconds,
+        averageRedisMillis,
+        maximumRedisMillis,
+        averageFirstCheckMillis
+    );
+
+    System.out.print(summary);
+    appendSummaryToFile(summary);
+}
