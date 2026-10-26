@@ -1,768 +1,585 @@
-**Keep the same batch reader. Extend it so each pending record knows which operation it is checking:**
+I checked your screenshots. Your batch reader and operation checks are already in place. These changes are all in TestRunner and use your existing settings:
 
-| Operation | Redis condition for success |
-|---|---|
-| Insert | JSON document exists |
-| Update | Document contains the exact new `data` value |
-| Delete | Document no longer exists |
+output_dir
+outputToFile
+redisReadBatch
+connectionCount
+runUpdates
+runDeletes
 
-For updates, use a **unique new value**, such as `"update-" + id + "-" + runId`, so the old record cannot accidentally pass.
+Follow these edits in order.
 
-Below are the changes to your current code. Your existing SQL update/delete statements stay in place.
+1. Add the imports and fields
 
-### 1. Add JSON parsing to `TestRunner`
+Add any missing imports:
 
-Keep `jsonMgetAsync()` reading the root path `"$"`.
-
-Add:
-
-```java
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
-```
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 
-Add this field:
+Beside your existing fields, add:
 
-```java
-private static final ObjectMapper JSON = new ObjectMapper();
-```
+private final ConcurrentLinkedQueue<Long> sqlCommitTimes =
+    new ConcurrentLinkedQueue<>();
+private static final Object CSV_LOCK = new Object();
 
-This uses Jackson 2’s JSON tree API. If you already have Jackson 2 in your project, reuse that dependency. [fasterxml.github.io](https://fasterxml.github.io/jackson-databind/javadoc/2.2/com/fasterxml/jackson/databind/ObjectMapper.html?utm_source=chatgpt.com)
+2. Replace your Metric record
 
-If missing, an example dependency is:
+Your current record has five fields. Replace it with:
 
-```xml
-<dependency>
-    <groupId>com.fasterxml.jackson.core</groupId>
-    <artifactId>jackson-databind</artifactId>
-    <version>2.20.0</version>
-</dependency>
-```
-
-### 2. Extend `PendingRead`
-
-Replace your existing `PendingRead` class with:
-
-```java
-private enum Operation {
-    INSERT,
-    UPDATE,
-    DELETE
-}
-
-private static final class PendingRead {
-
-    final Long id;
-    final String key;
-    final long committedNanos;
-
-    final Operation operation;
-    final String expectedData;
-
-    final CompletableFuture<Metric> result =
-        new CompletableFuture<>();
-
-    long firstCheckNanos;
-    long checks;
-
-    PendingRead(
-        Long id,
-        String key,
-        long committedNanos,
-        Operation operation,
-        String expectedData
-    ) {
-        this.id = id;
-        this.key = key;
-        this.committedNanos = committedNanos;
-        this.operation = operation;
-        this.expectedData = expectedData;
-    }
-}
-```
-
-**Purpose:** the batch reader can apply the correct success condition to each record.
-
-### 3. Generalize the registration method
-
-Replace `waitForKeyInRedis()` with these methods:
-
-```java
-// Preserves your existing insertion call.
-public CompletableFuture<Void> waitForKeyInRedis(
+record Metric(
     Long id,
+    double redisMillis,
+    double firstCheckDelayMillis,
+    long checks,
+    String operation,
     long committedNanos,
-    ConcurrentLinkedQueue<Metric> metrics
-) {
-    return registerObservation(
-        id,
-        committedNanos,
-        Operation.INSERT,
-        null,
-        metrics
-    );
-}
+    long observedNanos
+) {}
 
-public CompletableFuture<Void> waitForUpdateInRedis(
-    Long id,
-    long committedNanos,
-    String expectedData,
-    ConcurrentLinkedQueue<Metric> metrics
-) {
-    if (expectedData == null) {
-        throw new IllegalArgumentException(
-            "Expected update data must not be null"
-        );
-    }
+This preserves your existing fields and adds the timestamps needed for arrival counts and catch-up calculations.
 
-    return registerObservation(
-        id,
-        committedNanos,
-        Operation.UPDATE,
-        expectedData,
-        metrics
-    );
-}
+3. Update the successful metric in readJsonBatch()
 
-public CompletableFuture<Void> waitForDeleteInRedis(
-    Long id,
-    long committedNanos,
-    ConcurrentLinkedQueue<Metric> metrics
-) {
-    return registerObservation(
-        id,
-        committedNanos,
-        Operation.DELETE,
-        null,
-        metrics
-    );
-}
+In your last screenshot, find the new Metric(...) inside:
 
-private CompletableFuture<Void> registerObservation(
-    Long id,
-    long committedNanos,
-    Operation operation,
-    String expectedData,
-    ConcurrentLinkedQueue<Metric> metrics
-) {
-    PendingRead pending = new PendingRead(
-        id,
-        buildRedisKey(id),
-        committedNanos,
-        operation,
-        expectedData
-    );
+if (matchesExpectedState(pending, json)) {
 
-    if (pendingReads.putIfAbsent(id, pending) != null) {
-        return CompletableFuture.failedFuture(
-            new IllegalStateException(
-                "An observation is already pending for ID: " + id
-            )
-        );
-    }
+Replace only the metric construction with:
 
-    CompletableFuture<Void> collected =
-        pending.result.thenAccept(metrics::add);
+pending.result.complete(
+    new Metric(
+        pending.id,
+        (observedNanos - pending.committedNanos)
+            / 1_000_000.0,
+        (pending.firstCheckNanos - pending.committedNanos)
+            / 1_000_000.0,
+        pending.checks,
+        pending.operation.name(),
+        pending.committedNanos,
+        observedNanos
+    )
+);
 
-    long remainingNanos = Math.max(
-        0L,
-        TimeUnit.MILLISECONDS.toNanos(redisTimeout)
-            - (System.nanoTime() - committedNanos)
-    );
+Your screenshot currently uses TimeUnit.NANOSECONDS.toMillis(). That truncates fractional milliseconds. Dividing by 1_000_000.0 retains them.
 
-    try {
-        ScheduledFuture<?> timeoutTask = scheduler.schedule(
-            () -> timeoutPending(pending),
-            remainingNanos,
-            TimeUnit.NANOSECONDS
-        );
+4. Record SQL commits in all three worker methods
 
-        pending.result.whenComplete((metric, error) ->
-            timeoutTask.cancel(false)
-        );
+In runSingleInserts(), immediately after:
 
-    } catch (RuntimeException e) {
-        failPending(pending, e);
-    }
+long sqlCommittedNanos = System.nanoTime();
 
-    return collected;
-}
-```
+add:
 
-### 4. Add the operation-specific success check
+sqlCommitTimes.add(sqlCommittedNanos);
 
-Add this method to `TestRunner`:
-
-```java
-private boolean matchesExpectedState(
-    PendingRead pending,
-    String json
-) throws IOException {
-
-    switch (pending.operation) {
-        case INSERT:
-            return json != null;
-
-        case DELETE:
-            return json == null;
-
-        case UPDATE:
-            if (json == null) {
-                return false;
-            }
-
-            // JSON.MGET with "$" returns a JSON array containing
-            // the root document: [{"id":123,"data":"new-value"}]
-            JsonNode roots = JSON.readTree(json);
-
-            if (roots == null
-                    || !roots.isArray()
-                    || roots.size() != 1
-                    || !roots.get(0).isObject()) {
-                throw new IllegalStateException(
-                    "Unexpected root JSON for key: " + pending.key
-                );
-            }
-
-            // Match the actual field name/case in your Redis document.
-            JsonNode data = roots.get(0).get("data");
-
-            return data != null
-                && data.isTextual()
-                && pending.expectedData.equals(data.textValue());
-
-        default:
-            throw new IllegalStateException(
-                "Unsupported operation: " + pending.operation
-            );
-    }
-}
-```
-
-**Check that your Redis field is named `data`.** If RDI uses `"DATA"` or a nested structure, adjust that lookup.
-
-### 5. Change the success block in `readJsonBatch()`
-
-Find:
-
-```java
-String json = values.get(i);
-
-if (json != null) {
-    // Existing success block.
-}
-```
-
-Replace that block with:
-
-```java
-String json = values.get(i);
-
-try {
-    if (matchesExpectedState(pending, json)) {
-        pendingReads.remove(
-            pending.id,
-            pending
-        );
-
-        pending.result.complete(
-            new Metric(
-                pending.id,
-                (observedNanos - pending.committedNanos)
-                    / 1_000_000.0,
-                (pending.firstCheckNanos - pending.committedNanos)
-                    / 1_000_000.0,
-                pending.checks,
-                pending.operation.name()
-            )
-        );
-    }
-
-} catch (IOException | RuntimeException e) {
-    failPending(pending, e);
-}
-```
-
-Keep the existing timeout checks before this block.
-
-Now one shared `JSON.MGET` reader handles all three operations.
-
-Also change the timeout message so it fits every operation:
-
-```java
-private void timeoutPending(PendingRead pending) {
-    failPending(
-        pending,
-        new TimeoutException(
-            pending.operation
-                + " not observed within "
-                + redisTimeout
-                + " ms for key: "
-                + pending.key
-        )
-    );
-}
-```
-
-### 6. Register observations inside your existing SQL workers
-
-Your update/delete implementations were folded in the screenshots, so **keep their existing SQL method calls and argument order**. Add the following immediately after each successful SQL commit.
-
-**Inside an update task:**
-
-```java
-// Your existing SQL update call goes immediately above.
-// It must write row.data() and return after commit.
+In both runSingleUpdates() and runSingleDeletes(), immediately after:
 
 long committedNanos = System.nanoTime();
 
-redisChecks.add(
-    waitForUpdateInRedis(
-        row.id(),
-        committedNanos,
-        row.data(),
-        metrics
-    )
+add:
+
+sqlCommitTimes.add(committedNanos);
+
+Keep these lines before registering the Redis observation.
+
+This assumes your SQL methods return after successful commit. These timestamps include any work the SQL wrapper performs before returning.
+
+5. Update the three phase blocks in run()
+
+Keep your setup, warm-up, scheduled reader, and shutdown code.
+
+Insert block
+
+Replace the section from long insertStarted... through the old printOperationSummary(...) call with:
+
+sqlCommitTimes.clear();
+long insertStarted = System.nanoTime();
+List<Future<Long>> inserts = runSingleInserts(
+    rows,
+    sqlExecutor,
+    pool,
+    insertMetrics,
+    insertChecks
 );
-```
-
-The `Row` passed to that task should contain the new value:
-
-```java
-"update-" + id + "-" + runId
-```
-
-**Inside a delete task:**
-
-```java
-// Your existing SQL delete call goes immediately above.
-// id must be the Long ID of the deleted record.
-
-long committedNanos = System.nanoTime();
-
-redisChecks.add(
-    waitForDeleteInRedis(
-        id,
-        committedNanos,
-        metrics
-    )
+awaitAndReportPhase(
+    "INSERT",
+    rows.size(),
+    insertStarted,
+    inserts,
+    insertMetrics,
+    insertChecks
 );
-```
+List<Long> liveIds = new ArrayList<>(inserts.size());
+for (Future<Long> insert : inserts) {
+    liveIds.add(insert.get());
+}
 
-Pass `metrics` and `redisChecks` into your update/delete runner methods, just as you currently do for inserts.
+Update block
 
-**Retain each SQL task’s future.** If those methods currently discard the return from `executor.submit()`, collect and return them:
+Inside your existing if (runUpdates) block, keep row preparation and the two queues. Replace the timing, wait, and summary section with:
 
-```java
-List<Future<?>> tasks = new ArrayList<>();
+sqlCommitTimes.clear();
+long updateStarted = System.nanoTime();
+List<Future<?>> updates = runSingleUpdates(
+    rowsForUpdate,
+    sqlExecutor,
+    pool,
+    updateMetrics,
+    updateChecks
+);
+awaitAndReportPhase(
+    "UPDATE",
+    rowsForUpdate.size(),
+    updateStarted,
+    updates,
+    updateMetrics,
+    updateChecks
+);
 
-// Inside your existing loop:
-tasks.add(executor.submit(() -> {
-    // Existing SQL operation.
-    // Register the corresponding Redis observation here.
-}));
+Delete block
 
-// At the end of the method:
-return tasks;
-```
+Inside your existing if (runDeletes) block, keep the two queues. Replace the timing, wait, and summary section with:
 
-### 7. Wait between phases and keep the reader running
+sqlCommitTimes.clear();
+long deleteStarted = System.nanoTime();
+List<Future<?>> deletes = runSingleDeletes(
+    liveIds,
+    sqlExecutor,
+    pool,
+    deleteMetrics,
+    deleteChecks
+);
+awaitAndReportPhase(
+    "DELETE",
+    liveIds.size(),
+    deleteStarted,
+    deletes,
+    deleteMetrics,
+    deleteChecks
+);
 
-The sequence must be:
+Remove the old insertFinished, updateFinished, deleteFinished, and printOperationSummary(...) calls.
 
-1. Submit inserts; wait for their SQL tasks and Redis observations.
-2. Submit updates; wait for their SQL tasks and Redis observations.
-3. Submit deletes; wait for their SQL tasks and Redis observations.
-4. Cancel the polling task and close resources.
+Add this phase helper
 
-**Move `redisPollingTask.cancel(false)` to after the delete phase.** Keep the same scheduler and SQL executor alive throughout all three phases.
+Place this beside your existing awaitPhase() method. Keep awaitPhase() itself.
 
-This helper can perform each phase’s wait:
-
-```java
-private void awaitPhase(
+private void awaitAndReportPhase(
+    String operation,
+    int requested,
+    long startedNanos,
     List<? extends Future<?>> sqlTasks,
+    ConcurrentLinkedQueue<Metric> metrics,
     ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
 ) throws InterruptedException, ExecutionException {
-
-    ExecutionException sqlFailure = null;
-
-    // Finish all SQL tasks before taking the Redis-future snapshot.
-    for (Future<?> task : sqlTasks) {
-        try {
-            task.get();
-
-        } catch (ExecutionException e) {
-            if (sqlFailure == null) {
-                sqlFailure = e;
-            }
-        }
-    }
-
+    ExecutionException failure = null;
     try {
-        CompletableFuture.allOf(
-            redisChecks.toArray(new CompletableFuture<?>[0])
-        ).get();
-
+        awaitPhase(sqlTasks, redisChecks);
     } catch (ExecutionException e) {
-        if (sqlFailure != null) {
-            sqlFailure.addSuppressed(e);
-        } else {
-            throw e;
-        }
+        failure = e;
     }
-
-    if (sqlFailure != null) {
-        throw sqlFailure;
-    }
-}
-```
-
-Use a **fresh `redisChecks` collection for each phase**, or clear it only after `awaitPhase()` finishes. The metrics collection can accumulate all three operations because every metric now records `INSERT`, `UPDATE`, or `DELETE`.
-
-**For accurate delete results, only delete records whose presence was already confirmed.** A key that never appeared would otherwise immediately pass the “missing” check. Likewise, check SQL affected-row counts: an update/delete affecting zero rows should be reported as a failed SQL operation.
-
-Your summary should calculate averages separately by `Metric.operation()`, rather than combining insert, update, and delete timings.
-
-private List<Future<?>> runSingleUpdates(
-    List<Row> rows,
-    ThreadPoolExecutor executor,
-    HikariDataSource pool,
-    ConcurrentLinkedQueue<Metric> metrics,
-    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
-) {
-    List<Future<?>> tasks = new ArrayList<>(rows.size());
-
-    for (Row row : rows) {
-        tasks.add(executor.submit(() -> {
-            try {
-                sqlClient.update(
-                    pool,
-                    row.id(),
-                    row.data(),
-                    row.updateTimestamp(),
-                    row.updateTimestampUnix()
-                );
-
-                long committedNanos = System.nanoTime();
-
-                redisChecks.add(
-                    waitForUpdateInRedis(
-                        row.id(),
-                        committedNanos,
-                        row.data(),
-                        metrics
-                    )
-                );
-
-            } catch (SQLException e) {
-                throw new RuntimeException(
-                    "SQL update failed for ID: " + row.id(),
-                    e
-                );
-            }
-        }));
-    }
-
-    return tasks;
-}
-
-private List<Future<?>> runSingleDeletes(
-    List<Long> ids,
-    ThreadPoolExecutor executor,
-    HikariDataSource pool,
-    ConcurrentLinkedQueue<Metric> metrics,
-    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
-) {
-    List<Future<?>> tasks = new ArrayList<>(ids.size());
-
-    for (Long id : ids) {
-        tasks.add(executor.submit(() -> {
-            try {
-                sqlClient.delete(id, pool);
-
-                long committedNanos = System.nanoTime();
-
-                redisChecks.add(
-                    waitForDeleteInRedis(
-                        id,
-                        committedNanos,
-                        metrics
-                    )
-                );
-
-            } catch (SQLException e) {
-                throw new RuntimeException(
-                    "SQL delete failed for ID: " + id,
-                    e
-                );
-            }
-        }));
-    }
-
-    return tasks;
-}
-public void run() throws InterruptedException {
-
-    List<Row> rows = prepareRows(runId, recordCount);
-
-    ThreadPoolExecutor sqlExecutor =
-        (ThreadPoolExecutor)
-            Executors.newFixedThreadPool(connectionCount);
-
-    try (HikariDataSource pool = sqlClient.createPool()) {
-
-        try {
-            System.out.println("Warming SQL connections...");
-            warmPool(pool);
-
-            // Warm the existing Redis connection.
-            redisClient.exists(keyPrefix + "__warmup__");
-
-            sqlExecutor.prestartAllCoreThreads();
-            scheduler.prestartAllCoreThreads();
-
-            ScheduledFuture<?> redisPollingTask =
-                scheduler.scheduleWithFixedDelay(
-                    this::pollRedisBatches,
-                    0,
-                    pollInterval,
-                    TimeUnit.MILLISECONDS
-                );
-
-            try {
-                // ================= INSERT =================
-
-                ConcurrentLinkedQueue<Metric> insertMetrics =
-                    new ConcurrentLinkedQueue<>();
-
-                ConcurrentLinkedQueue<CompletableFuture<Void>>
-                    insertChecks = new ConcurrentLinkedQueue<>();
-
-                System.out.printf(
-                    "%nStarting %,d inserts%n",
-                    rows.size()
-                );
-
-                long insertStarted = System.nanoTime();
-
-                List<Future<Long>> inserts = runSingleInserts(
-                    rows,
-                    sqlExecutor,
-                    pool,
-                    insertMetrics,
-                    insertChecks
-                );
-
-                awaitPhase(inserts, insertChecks);
-
-                long insertFinished = System.nanoTime();
-
-                // Only proceed if SQL tasks and Redis observations
-                // for the insertion phase succeeded.
-                List<Long> liveIds = new ArrayList<>(inserts.size());
-
-                for (Future<Long> insert : inserts) {
-                    liveIds.add(insert.get());
-                }
-
-                printOperationSummary(
-                    "INSERT",
-                    rows.size(),
-                    insertStarted,
-                    insertFinished,
-                    insertMetrics
-                );
-
-
-                // ================= UPDATE =================
-
-                // Prepare unique update values before starting timing.
-                List<Row> rowsForUpdate =
-                    new ArrayList<>(liveIds.size());
-
-                for (Long id : liveIds) {
-                    Instant now = Instant.now();
-
-                    rowsForUpdate.add(new Row(
-                        id,
-                        "update-" + id + "-" + runId,
-                        Timestamp.from(now),
-                        now.getEpochSecond()
-                    ));
-                }
-
-                ConcurrentLinkedQueue<Metric> updateMetrics =
-                    new ConcurrentLinkedQueue<>();
-
-                ConcurrentLinkedQueue<CompletableFuture<Void>>
-                    updateChecks = new ConcurrentLinkedQueue<>();
-
-                System.out.printf(
-                    "%nStarting %,d updates%n",
-                    rowsForUpdate.size()
-                );
-
-                long updateStarted = System.nanoTime();
-
-                List<Future<?>> updates = runSingleUpdates(
-                    rowsForUpdate,
-                    sqlExecutor,
-                    pool,
-                    updateMetrics,
-                    updateChecks
-                );
-
-                awaitPhase(updates, updateChecks);
-
-                long updateFinished = System.nanoTime();
-
-                printOperationSummary(
-                    "UPDATE",
-                    rowsForUpdate.size(),
-                    updateStarted,
-                    updateFinished,
-                    updateMetrics
-                );
-
-
-                // ================= DELETE =================
-
-                ConcurrentLinkedQueue<Metric> deleteMetrics =
-                    new ConcurrentLinkedQueue<>();
-
-                ConcurrentLinkedQueue<CompletableFuture<Void>>
-                    deleteChecks = new ConcurrentLinkedQueue<>();
-
-                System.out.printf(
-                    "%nStarting %,d deletes%n",
-                    liveIds.size()
-                );
-
-                long deleteStarted = System.nanoTime();
-
-                List<Future<?>> deletes = runSingleDeletes(
-                    liveIds,
-                    sqlExecutor,
-                    pool,
-                    deleteMetrics,
-                    deleteChecks
-                );
-
-                awaitPhase(deletes, deleteChecks);
-
-                long deleteFinished = System.nanoTime();
-
-                printOperationSummary(
-                    "DELETE",
-                    liveIds.size(),
-                    deleteStarted,
-                    deleteFinished,
-                    deleteMetrics
-                );
-
-            } finally {
-                // Stop the shared reader after all phases,
-                // or if a phase fails.
-                redisPollingTask.cancel(false);
-            }
-
-        } finally {
-            // Stop workers before the SQL pool is closed.
-            sqlExecutor.shutdownNow();
-            scheduler.shutdownNow();
-
-            if (!sqlExecutor.awaitTermination(
-                    60, TimeUnit.SECONDS)) {
-                System.err.println(
-                    "SQL executor is still terminating."
-                );
-            }
-
-            if (!scheduler.awaitTermination(
-                    5, TimeUnit.SECONDS)) {
-                System.err.println(
-                    "Redis scheduler is still terminating."
-                );
-            }
-        }
-
-    } catch (SQLException e) {
-        throw new RuntimeException(
-            "SQL setup or connection warm-up failed",
-            e
-        );
-
-    } catch (ExecutionException e) {
-        // Do not start the next phase if the current phase failed.
-        throw new RuntimeException(
-            "Test phase failed during run " + runId,
-            e.getCause()
-        );
-
-    } finally {
-        sqlExecutor.shutdownNow();
-        scheduler.shutdownNow();
-
-        pendingReads.forEach((id, pending) ->
-            pending.result.completeExceptionally(
-                new CancellationException("Test run stopped")
-            )
-        );
-
-        pendingReads.clear();
+    long finishedNanos = System.nanoTime();
+    // Report the completed phase even if some tasks failed.
+    printBenchmarkSummary(
+        operation,
+        requested,
+        startedNanos,
+        finishedNanos,
+        metrics,
+        redisChecks
+    );
+    if (failure != null) {
+        throw failure;
     }
 }
 
-private void printOperationSummary(
+This saves results for failed phases while preserving your existing behavior of stopping before the next phase.
+
+6. Replace printOperationSummary() with this method
+
+This calculates the results, prints them, appends your existing text summary, and writes the CSV files.
+
+The column names come directly from ordered maps, so headers and values stay aligned.
+
+private void printBenchmarkSummary(
     String operation,
     int requested,
     long startedNanos,
     long finishedNanos,
-    ConcurrentLinkedQueue<Metric> metrics
+    ConcurrentLinkedQueue<Metric> metrics,
+    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
 ) {
-    double durationSeconds =
-        (finishedNanos - startedNanos) / 1_000_000_000.0;
-
-    double averageRedisMillis = metrics.stream()
-        .mapToDouble(Metric::redisMillis)
-        .average()
-        .orElse(Double.NaN);
-
-    double averageFirstCheckMillis = metrics.stream()
-        .mapToDouble(Metric::firstCheckDelayMillis)
-        .average()
-        .orElse(Double.NaN);
-
-    double maximumRedisMillis = metrics.stream()
-        .mapToDouble(Metric::redisMillis)
+    List<Metric> observations = List.copyOf(metrics);
+    List<Long> commits = List.copyOf(sqlCommitTimes);
+    String recordedAt = Instant.now().toString();
+    long sqlSucceeded = commits.size();
+    long observed = observations.size();
+    long lastCommit = commits.stream()
+        .mapToLong(Long::longValue)
         .max()
-        .orElse(Double.NaN);
-
-    String summary = String.format("""
-        
-        === %s SUMMARY ===
-        Run ID:                     %s
-        Recorded at:                %s
-        Requested operations:       %,d
-        Redis observations:         %,d
-        Phase duration:             %.3f seconds
-        Average observed delay:     %.3f ms
-        Maximum observed delay:     %.3f ms
-        Average first check delay:  %.3f ms
-        %n""",
-        operation,
-        runId,
-        Instant.now(),
-        requested,
-        metrics.size(),
-        durationSeconds,
-        averageRedisMillis,
-        maximumRedisMillis,
-        averageFirstCheckMillis
+        .orElse(startedNanos);
+    double sqlSeconds = sqlSucceeded == 0
+        ? Double.NaN
+        : (lastCommit - startedNanos) / 1_000_000_000.0;
+    double sqlRate = sqlSeconds > 0
+        ? sqlSucceeded / sqlSeconds
+        : Double.NaN;
+    long withinOneSecond = observations.stream()
+        .filter(m ->
+            m.observedNanos() - m.committedNanos()
+                <= TimeUnit.SECONDS.toNanos(1)
+        )
+        .count();
+    long observedBySqlFinish = observations.stream()
+        .filter(m -> m.observedNanos() <= lastCommit)
+        .count();
+    long failed = redisChecks.stream()
+        .filter(CompletableFuture::isCompletedExceptionally)
+        .count();
+    long timeouts = redisChecks.stream()
+        .filter(this::isTimeout)
+        .count();
+    double[] delays = observations.stream()
+        .mapToDouble(Metric::redisMillis)
+        .sorted()
+        .toArray();
+    long lastObserved = observations.stream()
+        .mapToLong(Metric::observedNanos)
+        .max()
+        .orElse(startedNanos);
+    boolean complete =
+        sqlSucceeded == requested
+            && observed == requested
+            && failed == 0;
+    // One summary row, including the test settings.
+    Map<String, Object> summary = csvBase(operation, recordedAt);
+    summary.put("requested_operations", requested);
+    summary.put("sql_workers", connectionCount);
+    summary.put("sql_pool_size", connectionCount);
+    summary.put("redis_read_batch_size", redisReadBatch);
+    summary.put("poll_interval_ms", pollInterval);
+    summary.put("redis_timeout_ms", redisTimeout);
+    summary.put("sql_commits_acknowledged", sqlSucceeded);
+    summary.put(
+        "sql_operations_not_acknowledged",
+        requested - sqlSucceeded
     );
-
-    System.out.print(summary);
-    appendSummaryToFile(summary);
+    summary.put("sql_duration_seconds", sqlSeconds);
+    summary.put("sql_acknowledged_operations_per_second", sqlRate);
+    summary.put("redis_observations", observed);
+    summary.put("observed_within_1_second", withinOneSecond);
+    summary.put(
+        "observed_after_1_second",
+        observed - withinOneSecond
+    );
+    summary.put("redis_timeouts", timeouts);
+    summary.put("redis_other_errors", failed - timeouts);
+    summary.put(
+        "unconfirmed_at_last_sql_commit",
+        sqlSucceeded - observedBySqlFinish
+    );
+    summary.put(
+        "average_delay_ms",
+        Arrays.stream(delays).average().orElse(Double.NaN)
+    );
+    summary.put("p50_delay_ms", percentile(delays, 0.50));
+    summary.put("p95_delay_ms", percentile(delays, 0.95));
+    summary.put("p99_delay_ms", percentile(delays, 0.99));
+    summary.put(
+        "maximum_delay_ms",
+        delays.length == 0
+            ? Double.NaN
+            : delays[delays.length - 1]
+    );
+    summary.put(
+        "average_first_check_delay_ms",
+        observations.stream()
+            .mapToDouble(Metric::firstCheckDelayMillis)
+            .average()
+            .orElse(Double.NaN)
+    );
+    summary.put(
+        "maximum_first_check_delay_ms",
+        observations.stream()
+            .mapToDouble(Metric::firstCheckDelayMillis)
+            .max()
+            .orElse(Double.NaN)
+    );
+    summary.put(
+        "phase_duration_seconds",
+        (finishedNanos - startedNanos) / 1_000_000_000.0
+    );
+    summary.put(
+        "all_changes_observed_seconds",
+        complete
+            ? (lastObserved - startedNanos) / 1_000_000_000.0
+            : null
+    );
+    summary.put(
+        "catch_up_seconds",
+        complete
+            ? Math.max(0L, lastObserved - lastCommit)
+                / 1_000_000_000.0
+            : null
+    );
+    summary.put("complete", complete);
+    // Arrival counts measured from the start of this phase.
+    Map<Long, Long> arrivals = new TreeMap<>();
+    for (Metric metric : observations) {
+        long second =
+            (metric.observedNanos() - startedNanos)
+                / TimeUnit.SECONDS.toNanos(1);
+        arrivals.merge(second, 1L, Long::sum);
+    }
+    List<Map<String, Object>> arrivalRows = new ArrayList<>();
+    long cumulative = 0;
+    long lastSecond = arrivals.keySet().stream()
+        .mapToLong(Long::longValue)
+        .max()
+        .orElse(-1);
+    StringBuilder text = new StringBuilder(
+        "\n=== " + operation + " BENCHMARK ===\n"
+    );
+    summary.forEach((key, value) ->
+        text.append(key)
+            .append(": ")
+            .append(csvCell(value).isEmpty() ? "N/A" : value)
+            .append('\n')
+    );
+    for (long second = 0; second <= lastSecond; second++) {
+        long count = arrivals.getOrDefault(second, 0L);
+        cumulative += count;
+        Map<String, Object> row =
+            csvBase(operation, recordedAt);
+        row.put("window_start_seconds", second);
+        row.put("window_end_seconds", second + 1);
+        row.put("newly_observed", count);
+        row.put("cumulative_observed", cumulative);
+        arrivalRows.add(row);
+        text.append(String.format(
+            Locale.ROOT,
+            "%d-%d s: new=%d, cumulative=%d%n",
+            second,
+            second + 1,
+            count,
+            cumulative
+        ));
+    }
+    System.out.print(text);
+    // Respect your existing configuration setting.
+    if (!outputToFile) {
+        return;
+    }
+    appendSummaryToFile(text.toString());
+    appendCsv(
+        "benchmark-summary.csv",
+        List.of(summary)
+    );
+    // Export every successful per-record observation.
+    List<Map<String, Object>> metricRows = new ArrayList<>();
+    for (Metric metric : observations) {
+        Map<String, Object> row =
+            csvBase(operation, recordedAt);
+        row.put("record_id", metric.id());
+        row.put("status", "OBSERVED");
+        row.put("observed_delay_ms", metric.redisMillis());
+        row.put(
+            "first_check_delay_ms",
+            metric.firstCheckDelayMillis()
+        );
+        row.put("checks", metric.checks());
+        row.put("committed_nanos", metric.committedNanos());
+        row.put("observed_nanos", metric.observedNanos());
+        row.put(
+            "commit_offset_ms",
+            (metric.committedNanos() - startedNanos)
+                / 1_000_000.0
+        );
+        row.put(
+            "observation_offset_ms",
+            (metric.observedNanos() - startedNanos)
+                / 1_000_000.0
+        );
+        row.put(
+            "observed_within_1_second",
+            metric.observedNanos() - metric.committedNanos()
+                <= TimeUnit.SECONDS.toNanos(1)
+        );
+        metricRows.add(row);
+    }
+    appendCsv("record-metrics.csv", metricRows);
+    appendCsv("arrivals-per-second.csv", arrivalRows);
+    // Preserve SQL commits even when Redis observation failed.
+    List<Map<String, Object>> commitRows = new ArrayList<>();
+    for (Long commit : commits) {
+        Map<String, Object> row =
+            csvBase(operation, recordedAt);
+        row.put("committed_nanos", commit);
+        row.put(
+            "commit_offset_ms",
+            (commit - startedNanos) / 1_000_000.0
+        );
+        commitRows.add(row);
+    }
+    appendCsv("sql-commits.csv", commitRows);
 }
+
+7. Add these calculation and CSV helpers
+
+Place these below the summary method. If you already added a method with the same name, replace it rather than duplicating it.
+
+private Map<String, Object> csvBase(
+    String operation,
+    String recordedAt
+) {
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("run_id", runId);
+    row.put("recorded_at_utc", recordedAt);
+    row.put("operation", operation);
+    return row;
+}
+private double percentile(
+    double[] sortedValues,
+    double fraction
+) {
+    if (sortedValues.length == 0) {
+        return Double.NaN;
+    }
+    int index =
+        (int) Math.ceil(fraction * sortedValues.length) - 1;
+    return sortedValues[index];
+}
+private boolean isTimeout(CompletableFuture<?> check) {
+    return check.handle((ignored, error) -> {
+        Throwable cause = error;
+        while (cause instanceof CompletionException
+                || cause instanceof ExecutionException) {
+            cause = cause.getCause();
+        }
+        return cause instanceof TimeoutException;
+    }).join();
+}
+private static String csvCell(Object value) {
+    if (value == null) {
+        return "";
+    }
+    if (value instanceof Double number
+            && !Double.isFinite(number)) {
+        return "";
+    }
+    if (value instanceof Float number
+            && !Float.isFinite(number)) {
+        return "";
+    }
+    String text = value.toString();
+    if (text.contains(",")
+            || text.contains("\"")
+            || text.contains("\n")
+            || text.contains("\r")) {
+        return "\"" + text.replace("\"", "\"\"") + "\"";
+    }
+    return text;
+}
+private static String csvLine(Object... values) {
+    return Arrays.stream(values)
+        .map(TestRunner::csvCell)
+        .collect(Collectors.joining(","));
+}
+private void appendCsv(
+    String filename,
+    List<Map<String, Object>> rows
+) {
+    if (rows.isEmpty()) {
+        return;
+    }
+    Path file = Path.of(output_dir).resolve(filename);
+    List<String> columns =
+        new ArrayList<>(rows.get(0).keySet());
+    String header = csvLine(columns.toArray());
+    for (Map<String, Object> row : rows) {
+        if (!columns.equals(new ArrayList<>(row.keySet()))) {
+            throw new IllegalArgumentException(
+                "Inconsistent CSV columns: " + filename
+            );
+        }
+    }
+    synchronized (CSV_LOCK) {
+        try {
+            Files.createDirectories(
+                file.toAbsolutePath().getParent()
+            );
+            boolean newFile =
+                !Files.exists(file) || Files.size(file) == 0;
+            if (!newFile) {
+                try (BufferedReader reader =
+                         Files.newBufferedReader(
+                             file,
+                             StandardCharsets.UTF_8
+                         )) {
+                    if (!header.equals(reader.readLine())) {
+                        throw new IOException(
+                            "CSV header mismatch: " + file
+                        );
+                    }
+                }
+            }
+            try (BufferedWriter writer =
+                     Files.newBufferedWriter(
+                         file,
+                         StandardCharsets.UTF_8,
+                         StandardOpenOption.CREATE,
+                         StandardOpenOption.APPEND
+                     )) {
+                if (newFile) {
+                    writer.write(header);
+                    writer.write("\r\n");
+                }
+                for (Map<String, Object> row : rows) {
+                    writer.write(
+                        csvLine(row.values().toArray())
+                    );
+                    writer.write("\r\n");
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                "Could not append " + file,
+                e
+            );
+        }
+    }
+}
+
+Keep your existing appendSummaryToFile() method.
+
+8. Validate with one small run
+
+Set outputToFile to true and run 100 records with updates and deletes enabled.
+
+In your configured output_dir, expect:
+
+File	Expected data rows if everything succeeds
+benchmark-summary.csv	3
+record-metrics.csv	300
+sql-commits.csv	300
+arrivals-per-second.csv	Depends on observation times
+
+Run again and confirm rows append without repeating headers. If an older CSV has different columns, use a new output directory; the writer intentionally rejects incompatible headers.
+
+I verified the reporting helpers with Java 17 sample data, including successful observations, timeouts, empty results, CSV escaping, and repeated appends. Your live SQL/RDI integration still needs that small validation run.
+
+Reporting limits: per-record CSV rows contain successful observations; timeouts/errors are counted in the summary. SQL commit rows contain timestamps without IDs because that is what sqlCommitTimes stores. All delay statistics describe Java-observed results, and incomplete runs leave full-completion/catch-up cells blank.
