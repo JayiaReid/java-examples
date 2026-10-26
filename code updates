@@ -1,0 +1,349 @@
+Yes—the version you implemented before Saturday already has the batch reader, operation-specific checks, and separate insert/update/delete phases. Keep those. Update what you record and how you summarize it.
+
+You need these measurements for each phase:
+
+Measurement	What it answers
+SQL acknowledged commits/sec	How quickly your program supplied changes
+Newly observed records per second	How quickly changes became visible
+Observed within 1 second of commit	Whether individual changes met the one-second target
+P50/P95/P99 delay	Typical and slower-record performance
+Unconfirmed when SQL finished	How much remained to be observed
+Catch-up time after SQL finished	How long the remaining observations took
+Timeouts/errors	Whether results were incomplete
+
+1. Add timestamps to your existing Metric
+
+Replace the record with:
+
+record Metric(
+    Long id,
+    double redisMillis,
+    double firstCheckDelayMillis,
+    long checks,
+    String operation,
+    long committedNanos,
+    long observedNanos
+) {}
+
+You retain the existing fields, so your current accessors still work.
+
+Inside readJsonBatch(), update the successful result construction:
+
+pending.result.complete(
+    new Metric(
+        pending.id,
+        (observedNanos - pending.committedNanos)
+            / 1_000_000.0,
+        (pending.firstCheckNanos - pending.committedNanos)
+            / 1_000_000.0,
+        pending.checks,
+        pending.operation.name(),
+        pending.committedNanos,
+        observedNanos
+    )
+);
+
+Purpose: calculate per-second arrivals and per-record deadlines afterward, without extra Redis requests.
+
+2. Track SQL commits separately
+
+Redis metrics only contain successful observations. You also need to count SQL commits whose changes were never observed.
+
+Add this field to TestRunner:
+
+private final ConcurrentLinkedQueue<Long> sqlCommitTimes =
+    new ConcurrentLinkedQueue<>();
+
+In all three SQL worker methods, immediately after your existing timestamp:
+
+long committedNanos = System.nanoTime();
+
+add:
+
+sqlCommitTimes.add(committedNanos);
+
+For example, the update worker becomes:
+
+sqlClient.update(
+    pool,
+    row.id(),
+    row.data(),
+    row.updateTimestamp(),
+    row.updateTimestampUnix()
+);
+long committedNanos = System.nanoTime();
+sqlCommitTimes.add(committedNanos);
+redisChecks.add(
+    waitForUpdateInRedis(
+        row.id(),
+        committedNanos,
+        row.data(),
+        metrics
+    )
+);
+
+This assumes the SQL method returns after successful commit. Capturing inside the SQL wrapper immediately after commit would give tighter timing if it currently does generated-key processing or cleanup before returning.
+
+3. Adjust each phase in run()
+
+Before submitting each phase, clear the SQL timestamps and capture its start.
+
+For your update phase, use this structure:
+
+sqlCommitTimes.clear();
+long updateStarted = System.nanoTime();
+List<Future<?>> updates = runSingleUpdates(
+    rowsForUpdate,
+    sqlExecutor,
+    pool,
+    updateMetrics,
+    updateChecks
+);
+ExecutionException updateFailure = null;
+try {
+    awaitPhase(updates, updateChecks);
+} catch (ExecutionException e) {
+    updateFailure = e;
+}
+// Print results even if some observations failed.
+printBenchmarkSummary(
+    "UPDATE",
+    rowsForUpdate.size(),
+    updateStarted,
+    updateMetrics,
+    updateChecks
+);
+if (updateFailure != null) {
+    throw updateFailure;
+}
+
+Apply that same structure to insert and delete using their existing variables.
+
+Replace the old printOperationSummary() calls with the new helper below. Keep phase preparation outside the measured section.
+
+This also fixes an issue in the earlier version: a failed awaitPhase() previously skipped the summary entirely.
+
+4. Add the benchmark summary helper
+
+Add these imports if missing:
+
+import java.util.Arrays;
+import java.util.Map;
+import java.util.TreeMap;
+
+Then add:
+
+private void printBenchmarkSummary(
+    String operation,
+    int requested,
+    long phaseStartedNanos,
+    ConcurrentLinkedQueue<Metric> metrics,
+    ConcurrentLinkedQueue<CompletableFuture<Void>> redisChecks
+) {
+    List<Metric> observations = List.copyOf(metrics);
+    List<Long> commits = List.copyOf(sqlCommitTimes);
+    long sqlSucceeded = commits.size();
+    long observed = observations.size();
+    long lastCommitNanos = commits.stream()
+        .mapToLong(Long::longValue)
+        .max()
+        .orElse(phaseStartedNanos);
+    double sqlDurationSeconds =
+        (lastCommitNanos - phaseStartedNanos)
+            / 1_000_000_000.0;
+    double sqlRate = sqlDurationSeconds > 0
+        ? sqlSucceeded / sqlDurationSeconds
+        : Double.NaN;
+    long withinOneSecond = observations.stream()
+        .filter(m ->
+            m.observedNanos() - m.committedNanos()
+                <= TimeUnit.SECONDS.toNanos(1)
+        )
+        .count();
+    long observedAfterOneSecond =
+        observed - withinOneSecond;
+    long observedBySqlFinish = observations.stream()
+        .filter(m ->
+            m.observedNanos() - lastCommitNanos <= 0
+        )
+        .count();
+    long unconfirmedAtSqlFinish =
+        sqlSucceeded - observedBySqlFinish;
+    long failedChecks = redisChecks.stream()
+        .filter(CompletableFuture::isCompletedExceptionally)
+        .count();
+    long timedOutChecks = redisChecks.stream()
+        .filter(this::isTimeout)
+        .count();
+    long otherReadErrors = failedChecks - timedOutChecks;
+    double[] delays = observations.stream()
+        .mapToDouble(Metric::redisMillis)
+        .sorted()
+        .toArray();
+    double averageDelay = Arrays.stream(delays)
+        .average()
+        .orElse(Double.NaN);
+    double averageFirstCheck = observations.stream()
+        .mapToDouble(Metric::firstCheckDelayMillis)
+        .average()
+        .orElse(Double.NaN);
+    double maximumFirstCheck = observations.stream()
+        .mapToDouble(Metric::firstCheckDelayMillis)
+        .max()
+        .orElse(Double.NaN);
+    long lastObservedNanos = observations.stream()
+        .mapToLong(Metric::observedNanos)
+        .max()
+        .orElse(phaseStartedNanos);
+    boolean complete =
+        sqlSucceeded == requested
+            && observed == requested
+            && failedChecks == 0;
+    String fullCompletion;
+    String catchUp;
+    if (complete) {
+        fullCompletion = String.format(
+            "%.3f seconds",
+            (lastObservedNanos - phaseStartedNanos)
+                / 1_000_000_000.0
+        );
+        catchUp = String.format(
+            "%.3f seconds",
+            Math.max(
+                0L,
+                lastObservedNanos - lastCommitNanos
+            ) / 1_000_000_000.0
+        );
+    } else {
+        fullCompletion = "Not established: incomplete results";
+        catchUp = "Not established: incomplete results";
+    }
+    StringBuilder summary = new StringBuilder();
+    summary.append(String.format("""
+        
+        === %s BENCHMARK ===
+        Run ID:                              %s
+        Recorded at:                         %s
+        Requested operations:                %,d
+        SQL commits acknowledged:            %,d
+        SQL operations not acknowledged:     %,d
+        SQL submission-to-last-commit time:   %.3f seconds
+        Acknowledged SQL operations/sec:      %.1f
+        Changes observed in Redis:           %,d
+        Observed within 1 second of commit:   %,d
+        Observed after 1 second of commit:    %,d
+        Redis observation timeouts:          %,d
+        Other Redis observation errors:      %,d
+        Unconfirmed at last SQL commit:      %,d
+        Average observed delay:              %.3f ms
+        P50 observed delay:                  %.3f ms
+        P95 observed delay:                  %.3f ms
+        P99 observed delay:                  %.3f ms
+        Maximum observed delay:              %.3f ms
+        Average first-check delay:           %.3f ms
+        Maximum first-check delay:           %.3f ms
+        Time until all changes observed:     %s
+        Catch-up after last SQL commit:      %s
+        %n""",
+        operation,
+        runId,
+        Instant.now(),
+        requested,
+        sqlSucceeded,
+        requested - sqlSucceeded,
+        sqlDurationSeconds,
+        sqlRate,
+        observed,
+        withinOneSecond,
+        observedAfterOneSecond,
+        timedOutChecks,
+        otherReadErrors,
+        unconfirmedAtSqlFinish,
+        averageDelay,
+        percentile(delays, 0.50),
+        percentile(delays, 0.95),
+        percentile(delays, 0.99),
+        delays.length == 0
+            ? Double.NaN
+            : delays[delays.length - 1],
+        averageFirstCheck,
+        maximumFirstCheck,
+        fullCompletion,
+        catchUp
+    ));
+    // Arrival windows measured from this phase's start.
+    Map<Long, Long> arrivalsPerSecond = new TreeMap<>();
+    for (Metric metric : observations) {
+        long second =
+            (metric.observedNanos() - phaseStartedNanos)
+                / TimeUnit.SECONDS.toNanos(1);
+        arrivalsPerSecond.merge(second, 1L, Long::sum);
+    }
+    summary.append(
+        "Observed arrivals by second from phase start:\n"
+    );
+    if (arrivalsPerSecond.isEmpty()) {
+        summary.append("No successful observations.\n");
+    } else {
+        long cumulative = 0;
+        long lastSecond = arrivalsPerSecond.keySet().stream()
+            .mapToLong(Long::longValue)
+            .max()
+            .orElse(0);
+        for (long second = 0; second <= lastSecond; second++) {
+            long newlyObserved =
+                arrivalsPerSecond.getOrDefault(second, 0L);
+            cumulative += newlyObserved;
+            summary.append(String.format(
+                "%d–%d s: new=%,d, cumulative=%,d%n",
+                second,
+                second + 1,
+                newlyObserved,
+                cumulative
+            ));
+        }
+    }
+    summary.append(System.lineSeparator());
+    System.out.print(summary);
+    appendSummaryToFile(summary.toString());
+}
+
+Add these two small helpers:
+
+private double percentile(
+    double[] sortedValues,
+    double percentile
+) {
+    if (sortedValues.length == 0) {
+        return Double.NaN;
+    }
+    int index =
+        (int) Math.ceil(percentile * sortedValues.length) - 1;
+    return sortedValues[index];
+}
+private boolean isTimeout(CompletableFuture<?> check) {
+    return check.handle((ignored, error) -> {
+        Throwable cause = error;
+        while (cause instanceof CompletionException
+                || cause instanceof ExecutionException) {
+            cause = cause.getCause();
+        }
+        return cause instanceof TimeoutException;
+    }).join();
+}
+
+Call the summary only after awaitPhase() finishes, including its ExecutionException path, so all futures being inspected have completed.
+
+Your output will now answer both meeting questions:
+
+0–1 s: new=..., cumulative=...
+1–2 s: new=..., cumulative=...
+
+shows arrivals over the workload’s timeline, while:
+
+Observed within 1 second of commit:
+Observed after 1 second of commit:
+
+shows individual replication-delay outcomes.
+
+Keep these interpretations: timeouts/errors are unconfirmed outcomes, not automatically “records taking longer than one second.” Per-second arrivals are Java observations, not Redis’s internal ingestion rate. Actual pipeline backlog still comes from RDI metrics. Also save the worker count, batch size, polling interval, timeout, and record count with each test so comparisons remain meaningful.
