@@ -1,0 +1,111 @@
+Next deliverables — From proof of concept to performance testing
+
+Goal: trust the measurements, run repeatable tests, and document what the results show.
+
+1. Upgrade the measurements
+
+* [ ]	Add committedNanos and observedNanos to Metric.
+* [ ]	Populate both timestamps in readJsonBatch().
+* [ ]	Confirm the SQL timestamp is captured after successful commit.
+* [ ]	Add sqlCommitTimes and record commits in insert, update, and delete workers.
+* [ ]	Clear SQL commit timestamps before each phase.
+* [ ]	Capture each phase’s start before submitting its SQL tasks.
+* [ ]	Update phase handling so failed runs still produce a summary.
+* [ ]	Add printBenchmarkSummary(), percentile(), and isTimeout().
+* [ ]	Replace the old summary calls.
+* [ ]	Confirm separate INSERT, UPDATE, and DELETE summaries append to the results file.
+
+Deliverable: updated code that records SQL throughput, Redis observations, timing, and failures.
+
+2. Validate the upgraded results
+
+* [ ]	Run 100 records with 10 SQL workers.
+* [ ]	Confirm all inserts appear in Redis.
+* [ ]	Confirm updates match the exact new values.
+* [ ]	Confirm deleted keys disappear.
+* [ ]	Confirm SQL commit counts and Redis observation counts match the workload.
+* [ ]	Confirm per-second arrival counts add up to the total observations.
+* [ ]	Confirm within-one-second and after-one-second counts add up to successful observations.
+* [ ]	Confirm timeouts and errors appear separately.
+* [ ]	Confirm catch-up time is reported only when the full workload is observed.
+* [ ]	Confirm summaries remain available if a phase fails.
+
+Deliverable: one validated 100-record cycle and its saved results.
+
+3. Prepare the test records
+
+* [ ]	Create a results spreadsheet.
+* [ ]	Record the code version being tested.
+* [ ]	Give each configuration a test ID.
+* [ ]	Record settings alongside every run.
+
+Keep these settings fixed initially:
+
+Redis read batch: 100 keys
+Polling interval: 5 ms
+Redis timeout: existing value
+SQL pool size: equal to SQL workers
+Payload size: consistent
+
+Deliverable: a results sheet ready for comparisons.
+
+4. Run the initial test sequence
+
+Complete one configuration before moving to the next.
+
+Done	Test	Records per operation	SQL workers	Runs
+☐	Warm-up — exclude from results	1,000	25	1
+☐	B01 — Baseline	1,000	25	3
+☐	V01 — Larger workload	10,000	25	3
+☐	C01 — Higher concurrency	10,000	50	3
+☐	C02 — Optional higher concurrency	10,000	100	3
+
+For each configuration:
+
+* [ ]	Record the test ID, settings, repetition, and start time.
+* [ ]	Before testing, capture RDI pending records and pod readiness/restarts.
+* [ ]	During testing, capture available Redis resource/latency metrics and RDI pending records.
+* [ ]	After testing, check whether pending returns to baseline.
+* [ ]	Check for new errors or pod restarts.
+* [ ]	Copy each operation’s summary into the spreadsheet.
+* [ ]	Reference timestamped screenshots in the notes.
+
+Deliverable: repeatable baseline, workload, and concurrency results.
+
+5. Extend to the workloads discussed in the meeting
+
+After the initial tests succeed:
+
+* [ ]	Test 30,000 records at a fixed SQL worker count.
+* [ ]	Repeat three times.
+* [ ]	Compare SQL delivery rate, per-second Redis observations, and catch-up time.
+* [ ]	If results remain healthy, repeat with 100,000 records.
+* [ ]	Keep worker count and reader settings unchanged when comparing workload sizes.
+
+Treat 20,000 records/sec as a hypothesis to investigate, not an established Redis limit.
+
+Deliverable: evidence of how larger workloads affect observed arrival rate and delay.
+
+6. Review the findings
+
+* [ ]	Compare SQL acknowledged commits/sec.
+* [ ]	Compare newly observed records in each one-second window.
+* [ ]	Compare records observed within one second of their own commit.
+* [ ]	Compare average, P50, P95, P99, and maximum delay.
+* [ ]	Compare average and maximum first-check delay.
+* [ ]	Compare records unconfirmed at SQL completion.
+* [ ]	Compare full completion and catch-up times.
+* [ ]	Report timeouts and errors beside successful timing results.
+* [ ]	Check whether higher concurrency improves throughput or mainly increases delay.
+* [ ]	Check whether reader settings materially affect measurements, changing one setting at a time.
+
+Deliverable: one comparison table and three evidence-backed findings.
+
+If a test fails
+
+* [ ]	Save the exact error, timestamp, configuration, and run ID.
+* [ ]	Keep the failed result in the spreadsheet.
+* [ ]	Stop increasing the workload.
+* [ ]	Record the next investigation needed before continuing.
+
+Remember: arrival counts measure when Java observed changes. RDI backlog comes from RDI metrics, and timeouts are unconfirmed outcomes—not successful latency measurements.
