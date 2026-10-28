@@ -1,0 +1,171 @@
+Yes. For your pipeline, use Azure SQL as the source of truth:
+
+Difference	Action
+Exists in SQL, missing from Redis	Report it—it may indicate replication delay or a failed write
+Exists in Redis, missing from SQL	Candidate for deletion from Redis
+Exists in both	Keep it
+
+Do not delete SQL rows just because Redis is missing them.
+
+Add this utility inside RedisClientManager. It uses your existing Lettuce connection, scans only your table’s key prefix, and defaults to a dry run.
+
+Run it between tests, with test writes stopped and RDI caught up. The comparison is not an atomic snapshot across both databases.
+
+import io.lettuce.core.KeyScanCursor;
+import io.lettuce.core.ScanArgs;
+import io.lettuce.core.ScanCursor;
+import io.lettuce.core.api.sync.RedisCommands;
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.HashSet;
+import java.util.Set;
+public record CleanupReport(
+    Set<String> sqlOnlyKeys,
+    Set<String> redisOnlyKeys,
+    long deletedKeys,
+    long skippedKeys
+) {}
+
+Add the methods:
+
+// Default: compare only. No deletion.
+public CleanupReport reconcileTestKeys(
+    DataSource sqlPool,
+    String keyPrefix
+) throws SQLException {
+    return reconcileTestKeys(sqlPool, keyPrefix, false);
+}
+public CleanupReport reconcileTestKeys(
+    DataSource sqlPool,
+    String keyPrefix,
+    boolean deleteRedisOnly
+) throws SQLException {
+    // Require a literal, non-empty table-specific prefix.
+    if (keyPrefix == null || keyPrefix.isBlank()) {
+        throw new IllegalArgumentException(
+            "A table-specific Redis key prefix is required"
+        );
+    }
+    for (String character : new String[]{"*", "?", "[", "]", "\\"}) {
+        if (keyPrefix.contains(character)) {
+            throw new IllegalArgumentException(
+                "Key prefix must not contain SCAN pattern characters"
+            );
+        }
+    }
+    RedisCommands<String, String> redis = connection.sync();
+    Set<String> expectedKeys = new HashSet<>();
+    Set<String> actualKeys = new HashSet<>();
+    long skipped = 0;
+    long deleted = 0;
+    try (Connection sql = sqlPool.getConnection()) {
+        sql.setAutoCommit(true);
+        // Change the table name to your actual source table.
+        try (PreparedStatement statement = sql.prepareStatement(
+                "SELECT id FROM dbo.RDI_TEST")) {
+            statement.setQueryTimeout(30);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    expectedKeys.add(
+                        keyPrefix + rows.getLong("id")
+                    );
+                }
+            }
+        }
+        ScanArgs scanArgs = ScanArgs.Builder
+            .matches(keyPrefix + "*")
+            .limit(500);
+        ScanCursor cursor = ScanCursor.INITIAL;
+        do {
+            KeyScanCursor<String> page =
+                redis.scan(cursor, scanArgs);
+            for (String key : page.getKeys()) {
+                // Restrict cleanup to the exact prefix + numeric ID format.
+                if (!key.startsWith(keyPrefix)) {
+                    skipped++;
+                    continue;
+                }
+                try {
+                    long id = Long.parseLong(
+                        key.substring(keyPrefix.length())
+                    );
+                    if (!key.equals(keyPrefix + id)) {
+                        skipped++;
+                        continue;
+                    }
+                    actualKeys.add(key);
+                } catch (NumberFormatException e) {
+                    skipped++;
+                }
+            }
+            cursor = page;
+        } while (!cursor.isFinished());
+        Set<String> sqlOnly = new HashSet<>(expectedKeys);
+        sqlOnly.removeAll(actualKeys);
+        Set<String> redisOnly = new HashSet<>(actualKeys);
+        redisOnly.removeAll(expectedKeys);
+        if (deleteRedisOnly) {
+            // Recheck SQL immediately before each deletion.
+            try (PreparedStatement lookup = sql.prepareStatement(
+                    "SELECT 1 FROM dbo.RDI_TEST WHERE id = ?")) {
+                lookup.setQueryTimeout(30);
+                for (String key : redisOnly) {
+                    long id = Long.parseLong(
+                        key.substring(keyPrefix.length())
+                    );
+                    lookup.setLong(1, id);
+                    boolean nowExistsInSql;
+                    try (ResultSet row = lookup.executeQuery()) {
+                        nowExistsInSql = row.next();
+                    }
+                    if (nowExistsInSql) {
+                        skipped++;
+                        continue;
+                    }
+                    deleted += redis.unlink(key);
+                }
+            }
+        }
+        return new CleanupReport(
+            Set.copyOf(sqlOnly),
+            Set.copyOf(redisOnly),
+            deleted,
+            skipped
+        );
+    }
+}
+
+SCAN incrementally visits keys; the set removes duplicate scan results. UNLINK removes a key and reclaims its memory asynchronously, including RedisJSON keys. 
+
+First, review the differences:
+
+var report = redisClient.reconcileTestKeys(
+    pool,
+    config.getRedisKeyPrefix()
+);
+System.out.println(
+    "SQL only: " + report.sqlOnlyKeys().size()
+);
+System.out.println(
+    "Redis only: " + report.redisOnlyKeys().size()
+);
+report.redisOnlyKeys().stream()
+    .limit(20)
+    .forEach(System.out::println);
+
+After reviewing, enable deletion:
+
+var report = redisClient.reconcileTestKeys(
+    pool,
+    config.getRedisKeyPrefix(),
+    true
+);
+System.out.println("Deleted: " + report.deletedKeys());
+System.out.println("Skipped: " + report.skippedKeys());
+
+Use the exact table-specific prefix from buildRedisKey(). The SQL queries must cover the same rows as your RDI mapping—apply the same filters if RDI only replicates part of the table.
+
+This is a simple in-memory utility suitable for your test dataset. For a clustered connection, confirm its SCAN covers the whole logical database. The fresh SQL check reduces stale deletions, but concurrent writes can still race with cleanup; stop test writers before running it.
