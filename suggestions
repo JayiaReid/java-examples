@@ -1,3 +1,105 @@
+I’d simplify in this order. The biggest change is one Redis polling loop shared by all records, instead of scheduling work separately for each record.
+
+1. Remove the per-record asynchronous tracking
+
+Remove:
+
+CompletableFuture<Metric> result
+
+from PendingRead, along with:
+
+* insertChecks, updateChecks, and deleteChecks.
+* The redisChecks arguments passed between methods.
+* The timeout task created inside registerObservation().
+* waitForKeyInRedis(), waitForUpdateInRedis(), and waitForDeleteInRedis().
+* awaitPhase() and awaitAndReportPhase() once their replacements are working.
+
+After committing a SQL operation, the worker should simply add its ID, expected value, and commit timestamp to the pending collection.
+
+2. Replace scheduled batch rounds with one reader loop
+
+Remove:
+
+ScheduledThreadPoolExecutor scheduler
+AtomicBoolean redisRoundRunning
+
+Replace pollRedisBatches() and readJsonBatch() with one reader running on its own thread:
+
+While SQL workers are running OR pending records remain:
+    Take up to the configured batch size of pending records.
+    Read those keys using JSON.MGET.
+    Capture the response timestamp immediately.
+    Mark matching records as observed.
+    Mark expired records as timed out.
+    Leave the rest pending.
+    Continue through the remaining batches.
+    Pause briefly between complete polling rounds.
+
+For simplicity, that reader can use synchronous JSON.MGET. Only its own thread waits for Redis; SQL workers continue independently.
+
+Keep a finite Redis command timeout. The reader must report a command failure rather than silently treating it as missing data.
+
+3. Consolidate the record tracking
+
+Remove the separate:
+
+sqlCommitTimes
+
+Keep one pending map and one finished-results collection.
+
+Each finished result needs only:
+
+Record ID
+Operation
+Status: OBSERVED / TIMEOUT / SQL_ERROR / REDIS_ERROR
+SQL commit acknowledgement timestamp, when available
+Redis observation timestamp, when available
+Error message, when applicable
+
+For inserts that fail before SQL returns an ID, use a local request number to identify the failed attempt.
+
+Calculate delay from the timestamps afterward. First-check delay and check count can be removed from the main report; retain them only if you are actively investigating reader overhead.
+
+4. Simplify each phase in run()
+
+Each phase should follow the same sequence:
+
+1. Prepare the workload.
+2. Start the Redis reader.
+3. Submit SQL operations to the existing worker pool.
+4. Wait for all SQL tasks to finish.
+5. Signal that SQL submission/processing is finished.
+6. Wait for the reader to finish the pending records.
+7. Calculate results and write CSV.
+8. Proceed to the next phase only if appropriate.
+
+Use an explicit completion signal for step 5. An empty pending map alone does not mean the phase is finished—SQL workers may still be preparing more entries.
+
+5. Reduce reporting to two CSV files
+
+File	Contents
+record-results.csv	One final outcome per attempted operation, including failures
+benchmark-summary.csv	Settings, counts, throughput, and delay statistics for each phase
+
+Remove the separate sql-commits.csv. Calculate arrival counts from the record results when needed rather than maintaining another export.
+
+Keep these summary measurements initially:
+
+* Requested operations, acknowledged SQL commits, and SQL operations/sec.
+* Observed changes, timeouts, and errors.
+* Average, P95, and maximum observed delay.
+* Total phase duration and catch-up time when all changes were observed.
+
+Keep these parts
+
+Keep your existing SQL client/authentication, HikariCP pool, bounded SQL workers, key-building method, and operation-specific matching:
+
+INSERT: document exists
+UPDATE: expected new value matches
+DELETE: document is absent
+
+Implement the reader/tracking simplification first, validate it with 100 records, then simplify reporting. That avoids changing the execution flow and all the output calculations at the same time.
+
 Replace your current TestRunner with this version. Keep your package declaration.
 
 It uses:
