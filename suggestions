@@ -1,0 +1,775 @@
+Replace your current TestRunner with this version. Keep your package declaration.
+
+It uses:
+
+* Your existing Config, SQL client, and Redis client.
+* One SQL worker pool.
+* One Redis reader thread.
+* One pending queue and one results queue per phase.
+* Two CSV files written after each phase.
+
+Your existing jsonMgetAsync() must still return CompletableFuture<List<String>> using the root JSON path "$".
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zaxxer.hikari.HikariDataSource;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+public class TestRunner {
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private final Config config;
+    private final String runId;
+    private final SqlServerClientManager sqlClient;
+    private final RedisClientManager redisClient;
+    private enum Operation {
+        INSERT, UPDATE, DELETE
+    }
+    private enum Status {
+        OBSERVED, TIMEOUT, SQL_ERROR, REDIS_ERROR
+    }
+    private record Row(
+        Long id,
+        String data,
+        Timestamp createTimestamp,
+        Long createTimestampUnix,
+        Timestamp updateTimestamp,
+        Long updateTimestampUnix
+    ) {}
+    private record Pending(
+        int requestNumber,
+        long id,
+        String expectedData,
+        long committedNanos
+    ) {}
+    private record Result(
+        int requestNumber,
+        Long id,
+        Status status,
+        long committedNanos,
+        long observedNanos,
+        String error
+    ) {
+        double delayMillis() {
+            return status == Status.OBSERVED
+                ? (observedNanos - committedNanos) / 1_000_000.0
+                : Double.NaN;
+        }
+    }
+    public TestRunner(
+        Config config,
+        String runId,
+        SqlServerClientManager sqlClient,
+        RedisClientManager redisClient
+    ) {
+        this.config = config;
+        this.runId = runId;
+        this.sqlClient = sqlClient;
+        this.redisClient = redisClient;
+    }
+    public void run() throws Exception {
+        if (config.getRecordCount() <= 0
+                || config.getConnectionPoolSize() <= 0
+                || config.getRedisReadBatchSize() <= 0
+                || config.getPollInterval() <= 0
+                || config.getRedisTimeout() <= 0) {
+            throw new IllegalArgumentException(
+                "Record count, pool size, batch size, "
+                    + "poll interval and timeout must be positive"
+            );
+        }
+        try (HikariDataSource pool = sqlClient.createPool()) {
+            ExecutorService sqlWorkers = Executors.newFixedThreadPool(
+                config.getConnectionPoolSize()
+            );
+            ExecutorService redisReader =
+                Executors.newSingleThreadExecutor();
+            try {
+                warmSqlPool(pool);
+                redisClient.exists(
+                    config.getRedisKeyPrefix() + "__warmup__"
+                );
+                List<Row> insertRows = prepareInsertRows();
+                List<Result> inserted = runPhase(
+                    Operation.INSERT,
+                    insertRows,
+                    pool,
+                    sqlWorkers,
+                    redisReader
+                );
+                List<Row> existingRows = inserted.stream()
+                    .map(result -> new Row(
+                        result.id(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null
+                    ))
+                    .toList();
+                if (config.isRunUpdates()) {
+                    List<Row> updateRows = prepareUpdateRows(existingRows);
+                    runPhase(
+                        Operation.UPDATE,
+                        updateRows,
+                        pool,
+                        sqlWorkers,
+                        redisReader
+                    );
+                }
+                if (config.isRunDeletes()) {
+                    runPhase(
+                        Operation.DELETE,
+                        existingRows,
+                        pool,
+                        sqlWorkers,
+                        redisReader
+                    );
+                }
+            } finally {
+                sqlWorkers.shutdownNow();
+                redisReader.shutdownNow();
+                sqlWorkers.awaitTermination(30, TimeUnit.SECONDS);
+                redisReader.awaitTermination(30, TimeUnit.SECONDS);
+            }
+        }
+    }
+    private List<Result> runPhase(
+        Operation operation,
+        List<Row> rows,
+        HikariDataSource pool,
+        ExecutorService sqlWorkers,
+        ExecutorService redisReader
+    ) throws Exception {
+        ConcurrentLinkedQueue<Pending> pending =
+            new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<Result> results =
+            new ConcurrentLinkedQueue<>();
+        AtomicBoolean sqlFinished = new AtomicBoolean(false);
+        System.out.printf(
+            "%nStarting %s: %,d records%n",
+            operation,
+            rows.size()
+        );
+        long startedNanos = System.nanoTime();
+        Future<?> reader = redisReader.submit(() -> {
+            readRedis(operation, pending, results, sqlFinished);
+            return null;
+        });
+        List<Future<?>> sqlTasks = new ArrayList<>(rows.size());
+        try {
+            for (int i = 0; i < rows.size(); i++) {
+                int requestNumber = i + 1;
+                Row row = rows.get(i);
+                sqlTasks.add(sqlWorkers.submit(() ->
+                    executeSql(
+                        operation,
+                        requestNumber,
+                        row,
+                        pool,
+                        pending,
+                        results
+                    )
+                ));
+            }
+            for (Future<?> task : sqlTasks) {
+                task.get();
+            }
+            sqlFinished.set(true);
+            // The reader continues until every pending record
+            // has been observed, timed out, or failed.
+            reader.get();
+            long finishedNanos = System.nanoTime();
+            List<Result> completed = results.stream()
+                .sorted(Comparator.comparingInt(Result::requestNumber))
+                .toList();
+            report(
+                operation,
+                rows.size(),
+                startedNanos,
+                finishedNanos,
+                completed
+            );
+            boolean phaseFailed = completed.stream()
+                .anyMatch(result -> result.status() != Status.OBSERVED);
+            if (phaseFailed) {
+                throw new IllegalStateException(
+                    operation
+                        + " phase was incomplete. See its results "
+                        + "before starting another phase."
+                );
+            }
+            return completed;
+        } finally {
+            sqlFinished.set(true);
+            if (!reader.isDone()) {
+                reader.cancel(true);
+            }
+            for (Future<?> task : sqlTasks) {
+                if (!task.isDone()) {
+                    task.cancel(true);
+                }
+            }
+        }
+    }
+    private void executeSql(
+        Operation operation,
+        int requestNumber,
+        Row row,
+        HikariDataSource pool,
+        ConcurrentLinkedQueue<Pending> pending,
+        ConcurrentLinkedQueue<Result> results
+    ) {
+        Long id = row.id();
+        long committedNanos = 0;
+        try {
+            switch (operation) {
+                case INSERT -> id = sqlClient.insert(
+                    pool,
+                    row.data(),
+                    row.createTimestamp(),
+                    row.createTimestampUnix(),
+                    row.updateTimestamp(),
+                    row.updateTimestampUnix()
+                );
+                case UPDATE -> sqlClient.update(
+                    pool,
+                    id,
+                    row.data(),
+                    row.updateTimestamp(),
+                    row.updateTimestampUnix()
+                );
+                case DELETE -> sqlClient.delete(id, pool);
+            }
+            // SQL methods must return after successful commit.
+            committedNanos = System.nanoTime();
+            if (id == null) {
+                throw new IllegalStateException(
+                    "SQL operation returned no record ID"
+                );
+            }
+            pending.add(new Pending(
+                requestNumber,
+                id,
+                row.data(),
+                committedNanos
+            ));
+        } catch (Exception e) {
+            results.add(new Result(
+                requestNumber,
+                id,
+                Status.SQL_ERROR,
+                committedNanos,
+                0,
+                errorMessage(e)
+            ));
+        }
+    }
+    private void readRedis(
+        Operation operation,
+        ConcurrentLinkedQueue<Pending> pending,
+        ConcurrentLinkedQueue<Result> results,
+        AtomicBoolean sqlFinished
+    ) throws InterruptedException {
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(
+            config.getRedisTimeout()
+        );
+        int batchSize = config.getRedisReadBatchSize();
+        while (!sqlFinished.get() || !pending.isEmpty()) {
+            // Process approximately one pass over the pending queue.
+            // Missing records are put back at the end.
+            int remainingThisRound = pending.size();
+            while (remainingThisRound > 0) {
+                List<Pending> batch = new ArrayList<>(batchSize);
+                int take = Math.min(batchSize, remainingThisRound);
+                for (int i = 0; i < take; i++) {
+                    Pending record = pending.poll();
+                    if (record == null) {
+                        break;
+                    }
+                    if (System.nanoTime() - record.committedNanos()
+                            >= timeoutNanos) {
+                        results.add(timeoutResult(record));
+                    } else {
+                        batch.add(record);
+                    }
+                }
+                remainingThisRound -= take;
+                if (batch.isEmpty()) {
+                    continue;
+                }
+                String[] keys = batch.stream()
+                    .map(record ->
+                        config.getRedisKeyPrefix() + record.id()
+                    )
+                    .toArray(String[]::new);
+                List<String> values;
+                long observedNanos;
+                try {
+                    // Wait only on this reader thread.
+                    // SQL workers continue independently.
+                    values = redisClient.jsonMgetAsync(keys).get(
+                        config.getRedisTimeout(),
+                        TimeUnit.MILLISECONDS
+                    );
+                    observedNanos = System.nanoTime();
+                    if (values == null || values.size() != batch.size()) {
+                        throw new IllegalStateException(
+                            "Unexpected JSON.MGET response size"
+                        );
+                    }
+                } catch (InterruptedException e) {
+                    throw e;
+                } catch (Exception e) {
+                    for (Pending record : batch) {
+                        results.add(new Result(
+                            record.requestNumber(),
+                            record.id(),
+                            Status.REDIS_ERROR,
+                            record.committedNanos(),
+                            0,
+                            errorMessage(e)
+                        ));
+                    }
+                    continue;
+                }
+                for (int i = 0; i < batch.size(); i++) {
+                    Pending record = batch.get(i);
+                    if (observedNanos - record.committedNanos()
+                            >= timeoutNanos) {
+                        results.add(timeoutResult(record));
+                        continue;
+                    }
+                    try {
+                        if (matches(
+                                operation,
+                                record.expectedData(),
+                                values.get(i))) {
+                            results.add(new Result(
+                                record.requestNumber(),
+                                record.id(),
+                                Status.OBSERVED,
+                                record.committedNanos(),
+                                observedNanos,
+                                null
+                            ));
+                        } else {
+                            pending.add(record);
+                        }
+                    } catch (Exception e) {
+                        results.add(new Result(
+                            record.requestNumber(),
+                            record.id(),
+                            Status.REDIS_ERROR,
+                            record.committedNanos(),
+                            0,
+                            errorMessage(e)
+                        ));
+                    }
+                }
+            }
+            if (!sqlFinished.get() || !pending.isEmpty()) {
+                Thread.sleep(config.getPollInterval());
+            }
+        }
+    }
+    private boolean matches(
+        Operation operation,
+        String expectedData,
+        String json
+    ) throws IOException {
+        if (operation == Operation.INSERT) {
+            return json != null;
+        }
+        if (operation == Operation.DELETE) {
+            return json == null;
+        }
+        if (json == null) {
+            return false;
+        }
+        // JSON.MGET with "$" returns:
+        // [{"id":123,"data":"expected-value"}]
+        JsonNode roots = JSON.readTree(json);
+        if (roots == null
+                || !roots.isArray()
+                || roots.size() != 1
+                || !roots.get(0).isObject()) {
+            throw new IllegalStateException(
+                "Unexpected JSON document structure"
+            );
+        }
+        JsonNode data = roots.get(0).get("data");
+        return data != null
+            && data.isTextual()
+            && expectedData.equals(data.textValue());
+    }
+    private Result timeoutResult(Pending record) {
+        return new Result(
+            record.requestNumber(),
+            record.id(),
+            Status.TIMEOUT,
+            record.committedNanos(),
+            0,
+            "Expected state not observed within "
+                + config.getRedisTimeout() + " ms"
+        );
+    }
+    private List<Row> prepareInsertRows() {
+        List<Row> rows = new ArrayList<>(config.getRecordCount());
+        for (int i = 0; i < config.getRecordCount(); i++) {
+            Instant now = Instant.now();
+            Timestamp timestamp = Timestamp.from(now);
+            long unix = now.getEpochSecond();
+            rows.add(new Row(
+                null,
+                "insert-" + i + "-" + runId,
+                timestamp,
+                unix,
+                timestamp,
+                unix
+            ));
+        }
+        return rows;
+    }
+    private List<Row> prepareUpdateRows(List<Row> existingRows) {
+        List<Row> rows = new ArrayList<>(existingRows.size());
+        for (Row existing : existingRows) {
+            Instant now = Instant.now();
+            rows.add(new Row(
+                existing.id(),
+                "update-" + existing.id() + "-" + runId,
+                null,
+                null,
+                Timestamp.from(now),
+                now.getEpochSecond()
+            ));
+        }
+        return rows;
+    }
+    private void warmSqlPool(
+        HikariDataSource pool
+    ) throws SQLException {
+        List<Connection> connections = new ArrayList<>();
+        try {
+            for (int i = 0;
+                 i < config.getConnectionPoolSize();
+                 i++) {
+                connections.add(pool.getConnection());
+            }
+        } finally {
+            SQLException failure = null;
+            for (Connection connection : connections) {
+                try {
+                    connection.close();
+                } catch (SQLException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+    private void report(
+        Operation operation,
+        int requested,
+        long startedNanos,
+        long finishedNanos,
+        List<Result> results
+    ) {
+        long acknowledged = results.stream()
+            .filter(result -> result.committedNanos() != 0)
+            .count();
+        long observed = count(results, Status.OBSERVED);
+        long timeouts = count(results, Status.TIMEOUT);
+        long sqlErrors = count(results, Status.SQL_ERROR);
+        long redisErrors = count(results, Status.REDIS_ERROR);
+        long lastCommit = results.stream()
+            .filter(result -> result.committedNanos() != 0)
+            .mapToLong(Result::committedNanos)
+            .max()
+            .orElse(startedNanos);
+        long lastObservation = results.stream()
+            .filter(result -> result.status() == Status.OBSERVED)
+            .mapToLong(Result::observedNanos)
+            .max()
+            .orElse(startedNanos);
+        double sqlSeconds = acknowledged == 0
+            ? Double.NaN
+            : (lastCommit - startedNanos) / 1_000_000_000.0;
+        double sqlRate = sqlSeconds > 0
+            ? acknowledged / sqlSeconds
+            : Double.NaN;
+        double[] delays = results.stream()
+            .filter(result -> result.status() == Status.OBSERVED)
+            .mapToDouble(Result::delayMillis)
+            .sorted()
+            .toArray();
+        double average = Arrays.stream(delays)
+            .average()
+            .orElse(Double.NaN);
+        double p95 = delays.length == 0
+            ? Double.NaN
+            : delays[(int) Math.ceil(delays.length * 0.95) - 1];
+        double maximum = delays.length == 0
+            ? Double.NaN
+            : delays[delays.length - 1];
+        long withinOneSecond = results.stream()
+            .filter(result -> result.status() == Status.OBSERVED)
+            .filter(result ->
+                result.observedNanos() - result.committedNanos()
+                    <= TimeUnit.SECONDS.toNanos(1)
+            )
+            .count();
+        double phaseSeconds =
+            (finishedNanos - startedNanos) / 1_000_000_000.0;
+        boolean complete =
+            observed == requested
+                && results.size() == requested
+                && acknowledged == requested;
+        Double catchUpSeconds = complete
+            ? Math.max(0L, lastObservation - lastCommit)
+                / 1_000_000_000.0
+            : null;
+        System.out.printf(Locale.ROOT, """
+            
+            %s results
+            Requested: %,d | SQL acknowledged: %,d | Observed: %,d
+            SQL errors: %,d | Redis errors: %,d | Timeouts: %,d
+            SQL rate: %.1f operations/sec
+            Delay: average %.3f ms | P95 %.3f ms | maximum %.3f ms
+            Observed within 1 second: %,d
+            Phase duration: %.3f seconds
+            Catch-up: %s
+            %n""",
+            operation,
+            requested,
+            acknowledged,
+            observed,
+            sqlErrors,
+            redisErrors,
+            timeouts,
+            sqlRate,
+            average,
+            p95,
+            maximum,
+            withinOneSecond,
+            phaseSeconds,
+            catchUpSeconds == null
+                ? "Not established"
+                : catchUpSeconds + " seconds"
+        );
+        if (!config.isOutputToFileEnabled()) {
+            return;
+        }
+        String recordedAt = Instant.now().toString();
+        List<String> recordRows = new ArrayList<>(results.size());
+        for (Result result : results) {
+            recordRows.add(csv(
+                runId,
+                operation,
+                result.requestNumber(),
+                result.id(),
+                result.status(),
+                result.committedNanos() == 0
+                    ? null
+                    : result.committedNanos(),
+                result.observedNanos() == 0
+                    ? null
+                    : result.observedNanos(),
+                result.committedNanos() == 0
+                    ? null
+                    : (result.committedNanos() - startedNanos)
+                        / 1_000_000.0,
+                result.observedNanos() == 0
+                    ? null
+                    : (result.observedNanos() - startedNanos)
+                        / 1_000_000.0,
+                result.delayMillis(),
+                result.error()
+            ));
+        }
+        appendCsv(
+            "record-results.csv",
+            csv(
+                "run_id",
+                "operation",
+                "request_number",
+                "record_id",
+                "status",
+                "committed_nanos",
+                "observed_nanos",
+                "commit_offset_ms",
+                "observation_offset_ms",
+                "observed_delay_ms",
+                "error"
+            ),
+            recordRows
+        );
+        appendCsv(
+            "benchmark-summary.csv",
+            csv(
+                "run_id",
+                "recorded_at_utc",
+                "operation",
+                "requested",
+                "sql_workers",
+                "redis_read_batch_size",
+                "poll_interval_ms",
+                "redis_timeout_ms",
+                "sql_acknowledged",
+                "sql_errors",
+                "redis_observed",
+                "redis_errors",
+                "redis_timeouts",
+                "sql_operations_per_second",
+                "average_delay_ms",
+                "p95_delay_ms",
+                "maximum_delay_ms",
+                "observed_within_1_second",
+                "phase_duration_seconds",
+                "catch_up_seconds",
+                "complete"
+            ),
+            List.of(csv(
+                runId,
+                recordedAt,
+                operation,
+                requested,
+                config.getConnectionPoolSize(),
+                config.getRedisReadBatchSize(),
+                config.getPollInterval(),
+                config.getRedisTimeout(),
+                acknowledged,
+                sqlErrors,
+                observed,
+                redisErrors,
+                timeouts,
+                sqlRate,
+                average,
+                p95,
+                maximum,
+                withinOneSecond,
+                phaseSeconds,
+                catchUpSeconds,
+                complete
+            ))
+        );
+    }
+    private long count(List<Result> results, Status status) {
+        return results.stream()
+            .filter(result -> result.status() == status)
+            .count();
+    }
+    private static String errorMessage(Throwable error) {
+        Throwable cause = error;
+        while (cause instanceof ExecutionException
+                || cause instanceof CompletionException) {
+            cause = cause.getCause();
+        }
+        return cause.getClass().getSimpleName()
+            + ": " + cause.getMessage();
+    }
+    private static String csv(Object... values) {
+        return Arrays.stream(values)
+            .map(TestRunner::csvCell)
+            .collect(Collectors.joining(","));
+    }
+    private static String csvCell(Object value) {
+        if (value == null) {
+            return "";
+        }
+        if (value instanceof Double number
+                && !Double.isFinite(number)) {
+            return "";
+        }
+        String text = value.toString();
+        if (text.contains(",")
+                || text.contains("\"")
+                || text.contains("\n")
+                || text.contains("\r")) {
+            return "\"" + text.replace("\"", "\"\"") + "\"";
+        }
+        return text;
+    }
+    private void appendCsv(
+        String filename,
+        String header,
+        List<String> rows
+    ) {
+        Path file = Path.of(config.getOutputDir()).resolve(filename);
+        try {
+            Files.createDirectories(
+                file.toAbsolutePath().getParent()
+            );
+            boolean newFile =
+                !Files.exists(file) || Files.size(file) == 0;
+            if (!newFile) {
+                try (BufferedReader reader =
+                         Files.newBufferedReader(
+                             file,
+                             StandardCharsets.UTF_8
+                         )) {
+                    if (!header.equals(reader.readLine())) {
+                        throw new IOException(
+                            "CSV header mismatch. Use a new output "
+                                + "directory for this version: " + file
+                        );
+                    }
+                }
+            }
+            try (BufferedWriter writer =
+                     Files.newBufferedWriter(
+                         file,
+                         StandardCharsets.UTF_8,
+                         StandardOpenOption.CREATE,
+                         StandardOpenOption.APPEND
+                     )) {
+                if (newFile) {
+                    writer.write(header);
+                    writer.write("\r\n");
+                }
+                for (String row : rows) {
+                    writer.write(row);
+                    writer.write("\r\n");
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                "Could not write results to " + file,
+                e
+            );
+        }
+    }
+}
+
+A few integration details:
+
+* Use a new output directory, because the summary columns differ from the previous version.
+* Keep your existing Redis connection and jsonMgetAsync() helper. The reader waits on one batch at a time; SQL workers continue independently.
+* The update matcher assumes the Redis field is named "data".
+* Your SQL methods must commit before returning and treat an update/delete affecting zero rows as a failure.
+* A failed phase saves its results and stops the run; it does not automatically clean up leftover rows.
+
+This version removes the scheduler, per-record futures, per-record timeout tasks, Redis future queues, and separate SQL timestamp queue. I haven’t run this replacement against your project or databases; validate it first with a 100-record cycle.
